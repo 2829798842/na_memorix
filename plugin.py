@@ -26,13 +26,18 @@ from src.plugin_system import (
     register_plugin,
 )
 from src.common.logger import get_logger
-from src.common.toml_utils import to_builtin_data
 import asyncio
 import uuid
 import time
 import json
 import datetime
 from .core.utils.io import atomic_write
+
+try:
+    # 旧版的麦麦有这个工具函数，新版的没有了，做个兼容
+    from src.common.toml_utils import to_builtin_data as _host_to_builtin_data
+except Exception:
+    _host_to_builtin_data = None
 
 # deleted imports
 
@@ -59,6 +64,52 @@ def _get_global_instance():
     return sys.modules.get("A_MEMORIX_GLOBAL_INSTANCE")
 
 
+def _to_builtin_data_compat(value: Any) -> Any:
+    """
+    将 tomlkit 节点转换为原生 Python 结构。
+
+    优先复用宿主实现；若宿主未提供，则使用兼容实现避免插件在导入阶段失败。
+    """
+    if _host_to_builtin_data is not None:
+        try:
+            return _host_to_builtin_data(value)
+        except Exception:
+            # 兜底到本地兼容实现，避免宿主实现异常影响插件加载。
+            pass
+
+    try:
+        unwrap = getattr(value, "unwrap", None)
+        if callable(unwrap):
+            value = unwrap()
+    except Exception:
+        pass
+
+    if isinstance(value, dict):
+        return {str(k): _to_builtin_data_compat(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_to_builtin_data_compat(v) for v in value]
+
+    items = getattr(value, "items", None)
+    if callable(items):
+        try:
+            return {str(k): _to_builtin_data_compat(v) for k, v in items()}
+        except Exception:
+            pass
+    return value
+
+
+def _is_a_memorix_plugin_id(plugin_id: Any) -> bool:
+    """兼容插件名与带命名空间的插件ID（如 A_Dawn.A_memorix）。"""
+    if not isinstance(plugin_id, str):
+        return False
+    normalized = plugin_id.strip().lower()
+    if not normalized:
+        return False
+    if normalized == "a_memorix":
+        return True
+    return normalized.split(".")[-1] == "a_memorix"
+
+
 def _patch_webui_a_memorix_routes_for_tomlkit_serialization() -> None:
     """
     运行时补丁：仅修正 A_Memorix 插件配置接口返回中的 tomlkit 节点序列化问题。
@@ -68,79 +119,96 @@ def _patch_webui_a_memorix_routes_for_tomlkit_serialization() -> None:
     - 仅在 plugin_id == "A_Memorix" 时做返回值原生化
     - 不修改核心源码文件，仅在插件加载后动态包裹路由回调
     """
-    try:
-        from src.webui import webui_server as webui_server_module
-    except Exception as e:
-        logger.debug(f"WebUI 模块未就绪，跳过配置接口补丁: {e}")
-        return
-
-    webui_server = getattr(webui_server_module, "_webui_server", None)
-    if webui_server is None:
-        logger.debug("WebUI 服务实例尚未创建，跳过配置接口补丁")
-        return
-
-    app = getattr(webui_server, "app", None)
-    if app is None:
-        logger.debug("WebUI 应用实例缺失，跳过配置接口补丁")
-        return
-
     target_paths = {
         "/api/webui/plugins/config/{plugin_id}",
         "/api/webui/plugins/config/{plugin_id}/schema",
+        "/plugins/config/{plugin_id}",
+        "/plugins/config/{plugin_id}/schema",
+        "/config/{plugin_id}",
+        "/config/{plugin_id}/schema",
     }
     patched_paths: list[str] = []
+    route_collections: list[list[Any]] = []
 
-    for route in getattr(app, "routes", []):
-        path = getattr(route, "path", "")
-        methods = getattr(route, "methods", set()) or set()
-        dependant = getattr(route, "dependant", None)
-        if path not in target_paths or "GET" not in methods or dependant is None:
-            continue
+    # 1) WebUI app 已创建时，直接补丁实际生效的 app.routes。
+    try:
+        from src.webui import webui_server as webui_server_module
 
-        original_call = getattr(dependant, "call", None)
-        if original_call is None:
-            continue
-        if getattr(original_call, "_a_memorix_tomlkit_patch_applied", False):
-            continue
+        webui_server = getattr(webui_server_module, "_webui_server", None)
+        app = getattr(webui_server, "app", None) if webui_server is not None else None
+        if app is not None:
+            route_collections.append(list(getattr(app, "routes", [])))
+    except Exception as e:
+        logger.debug(f"读取 WebUI app 路由失败，将尝试补丁 router 定义: {e}")
 
-        original_signature = inspect.signature(original_call)
+    # 2) app 未创建时，补丁 router.routes，确保后续 include_router 也使用已包裹 endpoint。
+    try:
+        from src.webui.routers import plugin as plugin_router_module
 
-        async def _patched_call(
-            *args,
-            __original_call=original_call,
-            __original_signature=original_signature,
-            **kwargs,
-        ):
-            result = await __original_call(*args, **kwargs)
-            plugin_id = None
-            try:
-                bound = __original_signature.bind_partial(*args, **kwargs)
-                plugin_id = bound.arguments.get("plugin_id")
-            except Exception:
-                plugin_id = kwargs.get("plugin_id")
+        plugin_router = getattr(plugin_router_module, "router", None)
+        if plugin_router is not None:
+            route_collections.append(list(getattr(plugin_router, "routes", [])))
+    except Exception as e:
+        logger.debug(f"读取插件路由定义失败: {e}")
 
-            if plugin_id != "A_Memorix" or not isinstance(result, dict):
-                return result
+    if not route_collections:
+        logger.debug("未获取到可补丁的路由集合，跳过配置接口补丁")
+        return
 
-            patched = dict(result)
-            if "config" in patched:
-                patched["config"] = to_builtin_data(patched.get("config"))
-            if "schema" in patched:
-                patched["schema"] = to_builtin_data(patched.get("schema"))
-            return patched
+    for routes in route_collections:
+        for route in routes:
+            path = getattr(route, "path", "")
+            methods = getattr(route, "methods", set()) or set()
+            dependant = getattr(route, "dependant", None)
+            if path not in target_paths or "GET" not in methods or dependant is None:
+                continue
 
-        _patched_call.__name__ = getattr(original_call, "__name__", "_patched_call")
-        _patched_call.__doc__ = getattr(original_call, "__doc__", None)
-        setattr(_patched_call, "_a_memorix_tomlkit_patch_applied", True)
+            original_call = getattr(dependant, "call", None)
+            if original_call is None:
+                continue
+            if getattr(original_call, "_a_memorix_tomlkit_patch_applied", False):
+                continue
 
-        dependant.call = _patched_call
-        if hasattr(route, "endpoint"):
-            route.endpoint = _patched_call
-        patched_paths.append(path)
+            original_signature = inspect.signature(original_call)
+
+            async def _patched_call(
+                *args,
+                __original_call=original_call,
+                __original_signature=original_signature,
+                **kwargs,
+            ):
+                result = await __original_call(*args, **kwargs)
+                plugin_id = None
+                try:
+                    bound = __original_signature.bind_partial(*args, **kwargs)
+                    plugin_id = bound.arguments.get("plugin_id")
+                except Exception:
+                    plugin_id = kwargs.get("plugin_id")
+
+                if not _is_a_memorix_plugin_id(plugin_id) or not isinstance(result, dict):
+                    return result
+
+                patched = dict(result)
+                if "config" in patched:
+                    patched["config"] = _to_builtin_data_compat(patched.get("config"))
+                if "schema" in patched:
+                    patched["schema"] = _to_builtin_data_compat(patched.get("schema"))
+                return patched
+
+            _patched_call.__name__ = getattr(original_call, "__name__", "_patched_call")
+            _patched_call.__doc__ = getattr(original_call, "__doc__", None)
+            setattr(_patched_call, "_a_memorix_tomlkit_patch_applied", True)
+
+            dependant.call = _patched_call
+            if hasattr(route, "endpoint"):
+                route.endpoint = _patched_call
+            patched_paths.append(path)
 
     if patched_paths:
         unique_paths = ", ".join(sorted(set(patched_paths)))
         logger.info(f"A_Memorix 已应用插件配置接口序列化补丁: {unique_paths}")
+    else:
+        logger.debug("A_Memorix 配置接口补丁未命中目标路由（可能等待 WebUI 路由注册）")
 
     # 补充说明：此补丁仅针对 A_Memorix 插件的配置接口进行结果原生化处理，确保返回给前端的数据结构不包含 tomlkit 的特殊类型，从而避免前端解析错误。
     # 其他插件不受影响，且仅在路径和方法完全匹配时才会进行处理，最大程度地减少了对Core的影响(迫真)(讨厌monkey patching但实在没有更优雅的方案了)
