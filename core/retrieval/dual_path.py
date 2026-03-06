@@ -14,9 +14,10 @@ import numpy as np
 
 from src.common.logger import get_logger
 from ..storage import VectorStore, GraphStore, MetadataStore
-from ..embedding import EmbeddingManager
+from ..embedding import EmbeddingAPIAdapter
 from ..utils.matcher import AhoCorasick
 from ..utils.time_parser import format_timestamp
+from .graph_relation_recall import GraphRelationRecallConfig, GraphRelationRecallService
 from .pagerank import PersonalizedPageRank, PageRankConfig
 from .sparse_bm25 import SparseBM25Config, SparseBM25Index
 
@@ -91,6 +92,7 @@ class DualPathRetrieverConfig:
     alpha: float = 0.5  # 融合权重
     enable_ppr: bool = True
     ppr_alpha: float = 0.85
+    ppr_timeout_seconds: float = 1.5
     ppr_concurrency_limit: int = 4
     enable_parallel: bool = True
     retrieval_strategy: RetrievalStrategy = RetrievalStrategy.DUAL_PATH
@@ -98,6 +100,7 @@ class DualPathRetrieverConfig:
     sparse: SparseBM25Config = field(default_factory=SparseBM25Config)
     fusion: "FusionConfig" = field(default_factory=lambda: FusionConfig())
     relation_intent: "RelationIntentConfig" = field(default_factory=lambda: RelationIntentConfig())
+    graph_recall: GraphRelationRecallConfig = field(default_factory=GraphRelationRecallConfig)
 
     def __post_init__(self):
         """验证配置"""
@@ -107,6 +110,8 @@ class DualPathRetrieverConfig:
             self.fusion = FusionConfig(**self.fusion)
         if isinstance(self.relation_intent, dict):
             self.relation_intent = RelationIntentConfig(**self.relation_intent)
+        if isinstance(self.graph_recall, dict):
+            self.graph_recall = GraphRelationRecallConfig(**self.graph_recall)
 
         if not 0 <= self.alpha <= 1:
             raise ValueError(f"alpha必须在[0, 1]之间: {self.alpha}")
@@ -119,6 +124,8 @@ class DualPathRetrieverConfig:
 
         if self.top_k_final <= 0:
             raise ValueError(f"top_k_final必须大于0: {self.top_k_final}")
+        if self.ppr_timeout_seconds <= 0:
+            raise ValueError(f"ppr_timeout_seconds必须大于0: {self.ppr_timeout_seconds}")
 
 
 @dataclass
@@ -204,7 +211,7 @@ class DualPathRetriever:
         vector_store: VectorStore,
         graph_store: GraphStore,
         metadata_store: MetadataStore,
-        embedding_manager: EmbeddingManager,
+        embedding_manager: EmbeddingAPIAdapter,
         sparse_index: Optional[SparseBM25Index] = None,
         config: Optional[DualPathRetrieverConfig] = None,
     ):
@@ -232,6 +239,11 @@ class DualPathRetriever:
             config=ppr_config,
         )
         self._ppr_semaphore = asyncio.Semaphore(self.config.ppr_concurrency_limit)
+        self._graph_relation_recall = GraphRelationRecallService(
+            graph_store=graph_store,
+            metadata_store=metadata_store,
+            config=self.config.graph_recall,
+        )
 
         logger.info(
             f"DualPathRetriever 初始化: "
@@ -436,6 +448,78 @@ class DualPathRetriever:
         for r in results:
             r.score = (float(r.score) - lo) / (hi - lo)
 
+    def _build_minmax_score_map(self, results: List[RetrievalResult]) -> Dict[str, float]:
+        if not results:
+            return {}
+        vals = [float(r.score) for r in results]
+        lo = min(vals)
+        hi = max(vals)
+        if hi - lo < 1e-12:
+            return {r.hash_value: 1.0 for r in results}
+        return {
+            r.hash_value: (float(r.score) - lo) / (hi - lo)
+            for r in results
+        }
+
+    @staticmethod
+    def _clone_retrieval_result(item: RetrievalResult) -> RetrievalResult:
+        return RetrievalResult(
+            hash_value=item.hash_value,
+            content=item.content,
+            score=float(item.score),
+            result_type=item.result_type,
+            source=item.source,
+            metadata=dict(item.metadata or {}),
+        )
+
+    def _extract_graph_seed_entities(self, query: str, limit: int = 2) -> List[str]:
+        entities = self._extract_entities(query)
+        if not entities:
+            return []
+        ranked = sorted(
+            entities.items(),
+            key=lambda x: (-float(x[1]), -len(str(x[0])), str(x[0]).lower()),
+        )
+        return [str(name) for name, _ in ranked[: max(0, int(limit))]]
+
+    def _search_relations_graph(
+        self,
+        query: str,
+        temporal: Optional[TemporalQueryOptions] = None,
+    ) -> List[RetrievalResult]:
+        service = getattr(self, "_graph_relation_recall", None)
+        if service is None or not bool(getattr(self.config.graph_recall, "enabled", True)):
+            return []
+
+        seed_entities = self._extract_graph_seed_entities(query, limit=2)
+        if not seed_entities:
+            return []
+
+        payloads = service.recall(seed_entities=seed_entities)
+        results: List[RetrievalResult] = []
+        for payload in payloads:
+            meta = payload.to_payload()
+            results.append(
+                RetrievalResult(
+                    hash_value=str(meta["hash"]),
+                    content=str(meta["content"]),
+                    score=0.0,
+                    result_type="relation",
+                    source="graph_relation_recall",
+                    metadata={
+                        "subject": meta["subject"],
+                        "predicate": meta["predicate"],
+                        "object": meta["object"],
+                        "confidence": float(meta["confidence"]),
+                        "graph_seed_entities": list(meta["graph_seed_entities"]),
+                        "graph_hops": int(meta["graph_hops"]),
+                        "graph_candidate_type": str(meta["graph_candidate_type"]),
+                        "supporting_paragraph_count": int(meta["supporting_paragraph_count"]),
+                    },
+                )
+            )
+        return self._apply_temporal_filter_to_relations(results, temporal)
+
     def _fuse_ranked_lists_weighted_rrf(
         self,
         vector_results: List[RetrievalResult],
@@ -588,6 +672,73 @@ class DualPathRetriever:
             elif old is not None and old.source != item.source:
                 old.source = "relation_fusion"
         out = list(merged.values())
+        out.sort(key=lambda x: x.score, reverse=True)
+        return out
+
+    def _merge_relation_results_graph_enhanced(
+        self,
+        vector_results: List[RetrievalResult],
+        sparse_results: List[RetrievalResult],
+        graph_results: List[RetrievalResult],
+    ) -> List[RetrievalResult]:
+        """Graph-aware relation fusion with semantic + graph + evidence scoring."""
+        vector_norm = self._build_minmax_score_map(vector_results)
+        sparse_norm = self._build_minmax_score_map(sparse_results)
+        graph_score_map = {
+            "direct_pair": 1.0,
+            "one_hop_seed": 0.75,
+            "two_hop_pair": 0.55,
+        }
+
+        merged: Dict[str, RetrievalResult] = {}
+        source_sets: Dict[str, set[str]] = {}
+        support_cache: Dict[str, int] = {}
+
+        for group in (vector_results, sparse_results, graph_results):
+            for item in group:
+                existing = merged.get(item.hash_value)
+                if existing is None:
+                    existing = self._clone_retrieval_result(item)
+                    merged[item.hash_value] = existing
+                else:
+                    for key, value in dict(item.metadata or {}).items():
+                        if key not in existing.metadata or existing.metadata.get(key) in (None, "", []):
+                            existing.metadata[key] = value
+                source_sets.setdefault(item.hash_value, set()).add(str(item.source or "").strip() or "relation_search")
+
+        out = list(merged.values())
+        for item in out:
+            meta = item.metadata if isinstance(item.metadata, dict) else {}
+            semantic_norm = max(
+                float(vector_norm.get(item.hash_value, 0.0)),
+                float(sparse_norm.get(item.hash_value, 0.0)),
+            )
+            graph_candidate_type = str(meta.get("graph_candidate_type", "") or "")
+            graph_score = float(graph_score_map.get(graph_candidate_type, 0.0))
+
+            if item.hash_value not in support_cache:
+                cached = meta.get("supporting_paragraph_count")
+                if cached is None:
+                    support_cache[item.hash_value] = len(
+                        self.metadata_store.get_paragraphs_by_relation(item.hash_value)
+                    )
+                else:
+                    support_cache[item.hash_value] = max(0, int(cached))
+            supporting_paragraph_count = support_cache[item.hash_value]
+            evidence_score = min(1.0, supporting_paragraph_count / 3.0)
+
+            meta["supporting_paragraph_count"] = supporting_paragraph_count
+            meta["graph_seed_entities"] = list(meta.get("graph_seed_entities") or [])
+            if "graph_hops" in meta:
+                meta["graph_hops"] = int(meta.get("graph_hops") or 0)
+            item.score = 0.60 * semantic_norm + 0.30 * graph_score + 0.10 * evidence_score
+
+            sources = source_sets.get(item.hash_value, set())
+            if len(sources) > 1:
+                item.source = "relation_fusion"
+            elif sources:
+                item.source = next(iter(sources))
+
         out.sort(key=lambda x: x.score, reverse=True)
         return out
 
@@ -751,7 +902,14 @@ class DualPathRetriever:
         if self._should_use_sparse_relations(embedding_ok, vector_results):
             sparse_results = self._search_relations_sparse(query=query, top_k=top_k, temporal=temporal)
 
-        if vector_results and sparse_results:
+        graph_results = self._search_relations_graph(query=query, temporal=temporal)
+        if graph_results:
+            results = self._merge_relation_results_graph_enhanced(
+                vector_results,
+                sparse_results,
+                graph_results,
+            )
+        elif vector_results and sparse_results:
             results = self._merge_relation_results(vector_results, sparse_results)
         else:
             results = vector_results if vector_results else sparse_results
@@ -851,6 +1009,10 @@ class DualPathRetriever:
                 temporal=temporal,
             )
 
+        graph_rel_results: List[RetrievalResult] = []
+        if bool(relation_intent.get("enabled", False)):
+            graph_rel_results = self._search_relations_graph(query=query, temporal=temporal)
+
         if self.config.fusion.method == "weighted_rrf" and para_results and sparse_para_results:
             para_results = self._fuse_ranked_lists_weighted_rrf(para_results, sparse_para_results)
         elif para_results and sparse_para_results:
@@ -859,7 +1021,13 @@ class DualPathRetriever:
         elif sparse_para_results and (not para_results or not embedding_ok):
             para_results = sparse_para_results
 
-        if rel_results and sparse_rel_results:
+        if graph_rel_results:
+            rel_results = self._merge_relation_results_graph_enhanced(
+                rel_results,
+                sparse_rel_results,
+                graph_rel_results,
+            )
+        elif rel_results and sparse_rel_results:
             rel_results = self._merge_relation_results(rel_results, sparse_rel_results)
         elif sparse_rel_results and (not rel_results or not embedding_ok):
             rel_results = sparse_rel_results
@@ -1274,12 +1442,27 @@ class DualPathRetriever:
             return results
 
         # 计算PPR分数 (放入线程池运行，避免阻塞主循环)
-        async with self._ppr_semaphore:
-            ppr_scores = await asyncio.to_thread(
-                self._ppr.compute,
-                personalization=entities,
-                normalize=True,
+        ppr_timeout_s = max(0.1, float(getattr(self.config, "ppr_timeout_seconds", 1.5) or 1.5))
+        try:
+            async with self._ppr_semaphore:
+                ppr_scores = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self._ppr.compute,
+                        personalization=entities,
+                        normalize=True,
+                    ),
+                    timeout=ppr_timeout_s,
+                )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "metric.ppr_timeout_skip_count=1 timeout_s=%s entities=%s",
+                ppr_timeout_s,
+                len(entities),
             )
+            return results
+        except Exception as e:
+            logger.warning(f"PPR 重排序失败，回退原排序: {e}")
+            return results
 
         # 调整结果分数
         ppr_scores_by_name = {
@@ -1588,6 +1771,10 @@ class DualPathRetriever:
                 "relation_intent_force_sparse": self.config.relation_intent.force_relation_sparse,
                 "relation_intent_pair_rerank_enabled": self.config.relation_intent.pair_predicate_rerank_enabled,
                 "relation_intent_pair_predicate_limit": self.config.relation_intent.pair_predicate_limit,
+                "graph_recall_enabled": self.config.graph_recall.enabled,
+                "graph_recall_candidate_k": self.config.graph_recall.candidate_k,
+                "graph_recall_allow_two_hop_pair": self.config.graph_recall.allow_two_hop_pair,
+                "graph_recall_max_paths": self.config.graph_recall.max_paths,
             },
             "vector_store": {
                 "size": int(vector_size),

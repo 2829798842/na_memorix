@@ -27,6 +27,25 @@ plugin_root = current_dir.parent
 project_root = plugin_root.parent.parent
 sys.path.insert(0, str(project_root))
 
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="将 LPMM 数据转换为 A_memorix 格式")
+    parser.add_argument("--input", "-i", required=True, help="包含 LPMM 数据的输入目录 (parquet, graphml)")
+    parser.add_argument("--output", "-o", required=True, help="A_memorix 数据的输出目录")
+    parser.add_argument("--dim", type=int, default=384, help="Embedding 维度 (必须与 LPMM 模型匹配)")
+    parser.add_argument("--batch-size", type=int, default=1024, help="Parquet 分批读取大小 (默认 1024)")
+    parser.add_argument(
+        "--skip-relation-vector-rebuild",
+        action="store_true",
+        help="跳过按关系元数据重建关系向量（默认开启）",
+    )
+    return parser
+
+
+# --help/-h fast path: avoid heavy host/plugin bootstrap
+if any(arg in {"-h", "--help"} for arg in sys.argv[1:]):
+    _build_arg_parser().print_help()
+    sys.exit(0)
+
 # 设置日志
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("LPMM_Converter")
@@ -182,9 +201,7 @@ class LPMMConverter:
             logger.warning("关系向量重建已启用，但写入服务不可用，已跳过。")
             return
 
-        rows = self.metadata_store.query(
-            "SELECT hash, subject, predicate, object FROM relations ORDER BY created_at ASC"
-        )
+        rows = self.metadata_store.get_relations()
         if not rows:
             logger.info("未发现关系元数据，无需重建关系向量。")
             return
@@ -368,7 +385,7 @@ class LPMMConverter:
                             store_id = self.metadata_store.add_paragraph(
                                 content=content,
                                 source="lpmm_import",
-                                knowledge_type="imported",
+                                knowledge_type="factual",
                             )
                         elif p_type == "entity":
                             store_id = self.metadata_store.add_entity(name=content)
@@ -495,17 +512,7 @@ class LPMMConverter:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="将 LPMM 数据转换为 A_memorix 格式")
-    parser.add_argument("--input", "-i", required=True, help="包含 LPMM 数据的输入目录 (parquet, graphml)")
-    parser.add_argument("--output", "-o", required=True, help="A_memorix 数据的输出目录")
-    parser.add_argument("--dim", type=int, default=384, help="Embedding 维度 (必须与 LPMM 模型匹配)")
-    parser.add_argument("--batch-size", type=int, default=1024, help="Parquet 分批读取大小 (默认 1024)")
-    parser.add_argument(
-        "--skip-relation-vector-rebuild",
-        action="store_true",
-        help="跳过按关系元数据重建关系向量（默认开启）",
-    )
-    
+    parser = _build_arg_parser()
     args = parser.parse_args()
     
     input_path = Path(args.input)

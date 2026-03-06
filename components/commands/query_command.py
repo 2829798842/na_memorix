@@ -17,15 +17,15 @@ from src.chat.message_receive.message import MessageRecv
 # 导入核心模块
 from ...core import (
     DualPathRetriever,
-    RetrievalStrategy,
-    DualPathRetrieverConfig,
     TemporalQueryOptions,
     DynamicThresholdFilter,
-    ThresholdMethod,
-    ThresholdConfig,
-    SparseBM25Config,
-    FusionConfig,
-    RelationIntentConfig,
+)
+from ...core.runtime import build_search_runtime
+from ...core.utils.aggregate_query_service import AggregateQueryService
+from ...core.utils.episode_retrieval_service import EpisodeRetrievalService
+from ...core.utils.search_execution_service import (
+    SearchExecutionRequest,
+    SearchExecutionService,
 )
 from ...core.utils.time_parser import parse_query_time_range
 from ...core.utils.person_profile_service import PersonProfileService
@@ -68,38 +68,6 @@ class QueryCommand(BaseCommand):
                    f"metadata_store={self.metadata_store is not None}, "
                    f"embedding_manager={self.embedding_manager is not None}")
 
-        # 兜底逻辑：如果配置中没有存储实例，尝试直接从插件系统获取
-        # 使用 is not None 检查，因为空对象可能布尔值为 False
-        if not all([
-            self.vector_store is not None,
-            self.graph_store is not None,
-            self.metadata_store is not None,
-            self.embedding_manager is not None
-        ]):
-            logger.warning(f"  配置不完整，尝试从插件实例获取...")
-            try:
-                from ...plugin import A_MemorixPlugin
-                instances = A_MemorixPlugin.get_storage_instances()
-                logger.info(f"  get_storage_instances() 返回: {list(instances.keys()) if instances else 'empty dict'}")
-                
-                if instances:
-                    self.vector_store = self.vector_store or instances.get("vector_store")
-                    self.graph_store = self.graph_store or instances.get("graph_store")
-                    self.metadata_store = self.metadata_store or instances.get("metadata_store")
-                    self.embedding_manager = self.embedding_manager or instances.get("embedding_manager")
-                    self.sparse_index = self.sparse_index or instances.get("sparse_index")
-                    
-                    logger.info(f"  兜底后: vector_store={self.vector_store is not None}, "
-                               f"graph_store={self.graph_store is not None}, "
-                               f"metadata_store={self.metadata_store is not None}, "
-                               f"embedding_manager={self.embedding_manager is not None}")
-                else:
-                    logger.error(f"  get_storage_instances() 返回空字典！")
-            except Exception as e:
-                logger.error(f"  兜底逻辑异常: {e}")
-                import traceback
-                traceback.print_exc()
-
         # 初始化检索器
         self.retriever: Optional[DualPathRetriever] = None
         self.threshold_filter: Optional[DynamicThresholdFilter] = None
@@ -123,85 +91,19 @@ class QueryCommand(BaseCommand):
 
     def _initialize_components(self) -> None:
         """初始化检索和过滤组件"""
-        try:
-            # 检查存储是否可用 (使用 is not None 而非布尔值，因为空对象可能为 False)
-            if not all([
-                self.vector_store is not None,
-                self.graph_store is not None,
-                self.metadata_store is not None,
-                self.embedding_manager is not None
-            ]):
-                logger.warning(f"{self.log_prefix} 存储组件未完全初始化")
-                return
-
-            # 创建检索器配置
-            sparse_cfg_raw = self.get_config("retrieval.sparse", {}) or {}
-            if not isinstance(sparse_cfg_raw, dict):
-                sparse_cfg_raw = {}
-            fusion_cfg_raw = self.get_config("retrieval.fusion", {}) or {}
-            if not isinstance(fusion_cfg_raw, dict):
-                fusion_cfg_raw = {}
-            relation_intent_cfg_raw = self.get_config("retrieval.search.relation_intent", {}) or {}
-            if not isinstance(relation_intent_cfg_raw, dict):
-                relation_intent_cfg_raw = {}
-            try:
-                sparse_cfg = SparseBM25Config(**sparse_cfg_raw)
-            except Exception as e:
-                logger.warning(f"{self.log_prefix} sparse 配置非法，回退默认: {e}")
-                sparse_cfg = SparseBM25Config()
-            try:
-                fusion_cfg = FusionConfig(**fusion_cfg_raw)
-            except Exception as e:
-                logger.warning(f"{self.log_prefix} fusion 配置非法，回退默认: {e}")
-                fusion_cfg = FusionConfig()
-            try:
-                relation_intent_cfg = RelationIntentConfig(**relation_intent_cfg_raw)
-            except Exception as e:
-                logger.warning(f"{self.log_prefix} relation_intent 配置非法，回退默认: {e}")
-                relation_intent_cfg = RelationIntentConfig()
-            config = DualPathRetrieverConfig(
-                top_k_paragraphs=self.get_config("retrieval.top_k_paragraphs", 20),
-                top_k_relations=self.get_config("retrieval.top_k_relations", 10),
-                top_k_final=self.get_config("retrieval.top_k_final", 10),
-                alpha=self.get_config("retrieval.alpha", 0.5),
-                enable_ppr=self.get_config("retrieval.enable_ppr", True),
-                ppr_alpha=self.get_config("retrieval.ppr_alpha", 0.85),
-                ppr_concurrency_limit=self.get_config("retrieval.ppr_concurrency_limit", 4),
-                enable_parallel=self.get_config("retrieval.enable_parallel", True),
-                retrieval_strategy=RetrievalStrategy.DUAL_PATH,
-                debug=self.debug_enabled,
-                sparse=sparse_cfg,
-                fusion=fusion_cfg,
-                relation_intent=relation_intent_cfg,
-            )
-
-            # 创建检索器
-            self.retriever = DualPathRetriever(
-                vector_store=self.vector_store,
-                graph_store=self.graph_store,
-                metadata_store=self.metadata_store,
-                embedding_manager=self.embedding_manager,
-                sparse_index=self.sparse_index,
-                config=config,
-            )
-
-            # 创建阈值过滤器
-            threshold_config = ThresholdConfig(
-                method=ThresholdMethod.ADAPTIVE,
-                min_threshold=self.get_config("threshold.min_threshold", 0.3),
-                max_threshold=self.get_config("threshold.max_threshold", 0.95),
-                percentile=self.get_config("threshold.percentile", 75.0),
-                std_multiplier=self.get_config("threshold.std_multiplier", 1.5),
-                min_results=self.get_config("threshold.min_results", 3),
-                enable_auto_adjust=self.get_config("threshold.enable_auto_adjust", True),
-            )
-
-            self.threshold_filter = DynamicThresholdFilter(threshold_config)
-
-            logger.info(f"{self.log_prefix} 查询组件初始化完成")
-
-        except Exception as e:
-            logger.error(f"{self.log_prefix} 组件初始化失败: {e}")
+        runtime = build_search_runtime(
+            plugin_config=self.plugin_config,
+            logger_obj=logger,
+            owner_tag="command",
+            log_prefix=self.log_prefix,
+        )
+        self.vector_store = runtime.vector_store
+        self.graph_store = runtime.graph_store
+        self.metadata_store = runtime.metadata_store
+        self.embedding_manager = runtime.embedding_manager
+        self.sparse_index = runtime.sparse_index
+        self.retriever = runtime.retriever
+        self.threshold_filter = runtime.threshold_filter
 
     async def execute(self) -> Tuple[bool, Optional[str], int]:
         """执行查询命令
@@ -209,17 +111,17 @@ class QueryCommand(BaseCommand):
         Returns:
             Tuple[bool, Optional[str], int]: (是否成功, 回复消息, 拦截级别)
         """
+        # 获取匹配的参数
+        mode = str(self.matched_groups.get("mode", "search") or "search").strip().lower()
+        content = self.matched_groups.get("content", "")
+
         # 检查组件是否初始化
-        if not self.retriever:
+        if not self.retriever and mode in {"search", "s", "time", "t"}:
             error_msg = "❌ 查询组件未初始化"
             return False, error_msg, 1
 
-        # 获取匹配的参数
-        mode = self.matched_groups.get("mode", "search")
-        content = self.matched_groups.get("content", "")
-
         # 如果没有内容，显示帮助
-        if not content and mode not in ["stats", "help"]:
+        if not content and mode not in ["stats", "help", "aggregate", "ag"]:
             help_msg = self._get_help_message()
             return True, help_msg, 1
 
@@ -231,6 +133,10 @@ class QueryCommand(BaseCommand):
                 success, result = await self._query_search(content)
             elif mode == "time" or mode == "t":
                 success, result = await self._query_time(content)
+            elif mode == "episode" or mode == "ep":
+                success, result = await self._query_episode(content)
+            elif mode == "aggregate" or mode == "ag":
+                success, result = await self._query_aggregate(content)
             elif mode == "entity" or mode == "e":
                 success, result = await self._query_entity(content)
             elif mode == "relation" or mode == "r":
@@ -339,6 +245,343 @@ class QueryCommand(BaseCommand):
             parsed[key] = value.strip()
         return parsed
 
+    @staticmethod
+    def _parse_bool_arg(value: Any, *, default: bool = False, arg_name: str = "参数") -> bool:
+        if value is None:
+            return bool(default)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(int(value))
+
+        token = str(value).strip().lower()
+        if token in {"1", "true", "yes", "on", "y"}:
+            return True
+        if token in {"0", "false", "no", "off", "n"}:
+            return False
+        raise ValueError(f"{arg_name} 必须是布尔值（true/false）")
+
+    def _resolve_search_context(self) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+        stream_id = None
+        group_id = None
+        user_id = None
+
+        chat_stream = getattr(self.message, "chat_stream", None)
+        if chat_stream is not None:
+            stream_id = getattr(chat_stream, "stream_id", None)
+            group_info = getattr(chat_stream, "group_info", None)
+            user_info = getattr(chat_stream, "user_info", None)
+            if group_info is not None:
+                group_id = getattr(group_info, "group_id", None)
+            if user_info is not None:
+                user_id = getattr(user_info, "user_id", None)
+
+        stream_text = str(stream_id).strip() if stream_id is not None else None
+        group_text = str(group_id).strip() if group_id is not None else None
+        user_text = str(user_id).strip() if user_id is not None else None
+        return stream_text or None, group_text or None, user_text or None
+
+    @staticmethod
+    def _serialize_episode_row(row: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "type": "episode",
+            "episode_id": str(row.get("episode_id", "") or ""),
+            "title": str(row.get("title", "") or ""),
+            "summary": str(row.get("summary", "") or ""),
+            "source": str(row.get("source", "") or ""),
+            "time_meta": {
+                "event_time_start": row.get("event_time_start"),
+                "event_time_end": row.get("event_time_end"),
+                "time_granularity": row.get("time_granularity"),
+                "time_confidence": row.get("time_confidence"),
+            },
+            "participants": list(row.get("participants", []) or []),
+            "keywords": list(row.get("keywords", []) or []),
+            "paragraph_count": int(row.get("paragraph_count") or 0),
+            "evidence_ids": list(row.get("evidence_ids", []) or []),
+            "llm_confidence": row.get("llm_confidence"),
+            "segmentation_model": row.get("segmentation_model"),
+            "segmentation_version": row.get("segmentation_version"),
+            "created_at": row.get("created_at"),
+            "updated_at": row.get("updated_at"),
+        }
+
+    async def _query_aggregate_search_or_time_branch(
+        self,
+        *,
+        query_type: str,
+        query: str,
+        top_k: int,
+        use_threshold: bool,
+        time_from: Optional[str],
+        time_to: Optional[str],
+        person: Optional[str],
+        source: Optional[str],
+    ) -> Dict[str, Any]:
+        if self.retriever is None:
+            return {
+                "success": False,
+                "query_type": query_type,
+                "error": "查询组件未初始化",
+                "content": "❌ 查询组件未初始化",
+                "results": [],
+                "count": 0,
+            }
+
+        stream_id, group_id, user_id = self._resolve_search_context()
+        execution = await SearchExecutionService.execute(
+            retriever=self.retriever,
+            threshold_filter=self.threshold_filter,
+            plugin_config=self.plugin_config,
+            request=SearchExecutionRequest(
+                caller="command",
+                stream_id=stream_id,
+                group_id=group_id,
+                user_id=user_id,
+                query_type=query_type,
+                query=str(query or "").strip(),
+                top_k=top_k,
+                time_from=str(time_from) if time_from is not None else None,
+                time_to=str(time_to) if time_to is not None else None,
+                person=str(person).strip() if person else None,
+                source=str(source).strip() if source else None,
+                use_threshold=bool(use_threshold),
+                enable_ppr=bool(self.get_config("retrieval.enable_ppr", True)),
+            ),
+            enforce_chat_filter=True,
+            reinforce_access=True,
+        )
+
+        if not execution.success:
+            return {
+                "success": False,
+                "query_type": query_type,
+                "error": execution.error,
+                "content": f"❌ {execution.error}",
+                "results": [],
+                "count": 0,
+            }
+
+        if execution.chat_filtered:
+            return {
+                "success": True,
+                "query_type": query_type,
+                "results": [],
+                "count": 0,
+                "elapsed_ms": execution.elapsed_ms,
+                "chat_filtered": True,
+                "content": "",
+            }
+
+        serialized_results = SearchExecutionService.to_serializable_results(execution.results)
+        if query_type == "search":
+            preview = [str(item.get("content", "") or "") for item in serialized_results[:3]]
+            content = "\n".join(preview) if preview else "未找到相关结果。"
+        else:
+            preview = []
+            for item in serialized_results[:3]:
+                time_meta = item.get("metadata", {}).get("time_meta", {})
+                s_text = time_meta.get("effective_start_text", "N/A")
+                e_text = time_meta.get("effective_end_text", "N/A")
+                text = str(item.get("content", "") or "")
+                preview.append(f"{text} ({s_text}~{e_text})")
+            content = "\n".join(preview) if preview else "未找到符合时间条件的结果。"
+
+        payload = {
+            "success": True,
+            "query_type": query_type,
+            "results": serialized_results,
+            "count": len(serialized_results),
+            "elapsed_ms": execution.elapsed_ms,
+            "content": content,
+            "dedup_hit": execution.dedup_hit,
+        }
+        if query_type == "time":
+            payload.update(
+                {
+                    "time_from": time_from,
+                    "time_to": time_to,
+                    "person": person,
+                    "source": source,
+                }
+            )
+        return payload
+
+    async def _query_aggregate_episode_branch(
+        self,
+        *,
+        query: str,
+        top_k: int,
+        time_from_ts: Optional[float],
+        time_to_ts: Optional[float],
+        person: Optional[str],
+        source: Optional[str],
+        include_paragraphs: bool,
+    ) -> Dict[str, Any]:
+        if self.metadata_store is None:
+            return {
+                "success": False,
+                "query_type": "episode",
+                "error": "MetadataStore 未初始化",
+                "content": "❌ MetadataStore 未初始化",
+                "results": [],
+                "count": 0,
+            }
+        if not bool(self.get_config("episode.enabled", True)):
+            return {
+                "success": False,
+                "query_type": "episode",
+                "error": "episode.enabled=false",
+                "content": "❌ Episode 模块未启用",
+                "results": [],
+                "count": 0,
+            }
+        if not bool(self.get_config("episode.query_enabled", True)):
+            return {
+                "success": False,
+                "query_type": "episode",
+                "error": "episode.query_enabled=false",
+                "content": "❌ Episode 查询已禁用",
+                "results": [],
+                "count": 0,
+            }
+
+        episode_service = EpisodeRetrievalService(
+            metadata_store=self.metadata_store,
+            retriever=self.retriever,
+        )
+        rows = await episode_service.query(
+            query=str(query or "").strip(),
+            top_k=max(1, int(top_k)),
+            time_from=time_from_ts,
+            time_to=time_to_ts,
+            person=str(person).strip() if person else None,
+            source=str(source).strip() if source else None,
+            include_paragraphs=False,
+        )
+        results = [self._serialize_episode_row(row) for row in rows]
+        if include_paragraphs:
+            for item in results:
+                paragraphs = self.metadata_store.get_episode_paragraphs(
+                    episode_id=str(item.get("episode_id") or ""),
+                    limit=50,
+                )
+                item["paragraphs"] = paragraphs
+
+        return {
+            "success": True,
+            "query_type": "episode",
+            "results": results,
+            "count": len(results),
+            "content": f"找到 {len(results)} 条 episode。",
+        }
+
+    async def _query_aggregate(self, content: str) -> Tuple[bool, str]:
+        args = self._parse_kv_args(content)
+        query = str(args.get("q") or args.get("query") or "").strip()
+        time_from = args.get("from") or args.get("start")
+        time_to = args.get("to") or args.get("end")
+        person = str(args.get("person") or "").strip() or None
+        source = str(args.get("source") or "").strip() or None
+
+        top_k_default = int(
+            self.get_config(
+                "retrieval.aggregate.default_top_k",
+                self.get_config("episode.default_top_k", 5),
+            )
+        )
+        top_k = top_k_default
+        if "top_k" in args:
+            try:
+                top_k = max(1, int(args["top_k"]))
+            except ValueError:
+                return False, "❌ top_k 必须是整数"
+
+        try:
+            mix = self._parse_bool_arg(
+                args.get("mix"),
+                default=bool(self.get_config("retrieval.aggregate.default_mix", False)),
+                arg_name="mix",
+            )
+        except ValueError as e:
+            return False, f"❌ {e}"
+
+        mix_top_k: Optional[int] = None
+        if "mix_top_k" in args:
+            try:
+                mix_top_k = max(1, int(args["mix_top_k"]))
+            except ValueError:
+                return False, "❌ mix_top_k 必须是整数"
+
+        try:
+            include_paragraphs = self._parse_bool_arg(
+                args.get("include_paragraphs"),
+                default=False,
+                arg_name="include_paragraphs",
+            )
+            use_threshold = self._parse_bool_arg(
+                args.get("use_threshold"),
+                default=True,
+                arg_name="use_threshold",
+            )
+        except ValueError as e:
+            return False, f"❌ {e}"
+
+        try:
+            time_from_ts, time_to_ts = parse_query_time_range(time_from, time_to)
+        except ValueError as e:
+            return False, f"❌ 时间参数错误: {e}"
+
+        aggregate_service = AggregateQueryService(plugin_config=self.plugin_config)
+
+        async def _search_runner() -> Dict[str, Any]:
+            return await self._query_aggregate_search_or_time_branch(
+                query_type="search",
+                query=query,
+                top_k=top_k,
+                use_threshold=use_threshold,
+                time_from=time_from,
+                time_to=time_to,
+                person=person,
+                source=source,
+            )
+
+        async def _time_runner() -> Dict[str, Any]:
+            return await self._query_aggregate_search_or_time_branch(
+                query_type="time",
+                query=query,
+                top_k=top_k,
+                use_threshold=use_threshold,
+                time_from=time_from,
+                time_to=time_to,
+                person=person,
+                source=source,
+            )
+
+        async def _episode_runner() -> Dict[str, Any]:
+            return await self._query_aggregate_episode_branch(
+                query=query,
+                top_k=top_k,
+                time_from_ts=time_from_ts,
+                time_to_ts=time_to_ts,
+                person=person,
+                source=source,
+                include_paragraphs=include_paragraphs,
+            )
+
+        result = await aggregate_service.execute(
+            query=query,
+            top_k=top_k,
+            mix=mix,
+            mix_top_k=mix_top_k,
+            time_from=time_from,
+            time_to=time_to,
+            search_runner=_search_runner,
+            time_runner=_time_runner,
+            episode_runner=_episode_runner,
+        )
+        return bool(result.get("success", False)), str(result.get("content", "") or "")
+
     async def _query_time(self, content: str) -> Tuple[bool, str]:
         """
         时序检索: /query time q=... from=... to=... person=... source=... top_k=...
@@ -435,6 +678,69 @@ class QueryCommand(BaseCommand):
             lines.append("")
 
         lines.append(f"📊 共 {len(results)} 条结果（段落: {len(paragraphs)}, 关系: {len(relations)}）")
+        return True, "\n".join(lines)
+
+    async def _query_episode(self, content: str) -> Tuple[bool, str]:
+        """
+        Episode 查询:
+        /query episode q=... from=... to=... person=... source=... top_k=...
+        """
+        if not bool(self.get_config("episode.enabled", True)):
+            return False, "❌ Episode 模块未启用（episode.enabled=false）"
+        if not bool(self.get_config("episode.query_enabled", True)):
+            return False, "❌ Episode 查询已禁用（episode.query_enabled=false）"
+        if self.metadata_store is None:
+            return False, "❌ MetadataStore 未初始化"
+
+        args = self._parse_kv_args(content)
+        query = str(args.get("q") or args.get("query") or "").strip()
+        time_from = args.get("from") or args.get("start")
+        time_to = args.get("to") or args.get("end")
+        person = str(args.get("person") or "").strip() or None
+        source = str(args.get("source") or "").strip() or None
+
+        top_k = int(self.get_config("episode.default_top_k", 5))
+        if "top_k" in args:
+            try:
+                top_k = max(1, int(args["top_k"]))
+            except ValueError:
+                return False, "❌ top_k 必须是整数"
+
+        try:
+            ts_from, ts_to = parse_query_time_range(time_from, time_to)
+        except ValueError as e:
+            return False, f"❌ 时间参数错误: {e}"
+
+        episode_service = EpisodeRetrievalService(
+            metadata_store=self.metadata_store,
+            retriever=self.retriever,
+        )
+        results = await episode_service.query(
+            query=query,
+            top_k=top_k,
+            time_from=ts_from,
+            time_to=ts_to,
+            person=person,
+            source=source,
+            include_paragraphs=False,
+        )
+        if not results:
+            return True, "🧠 未找到匹配的 Episode 结果"
+
+        lines = [f"🧠 Episode 查询结果（共 {len(results)} 条）", ""]
+        for idx, item in enumerate(results, 1):
+            episode_id = str(item.get("episode_id", "") or "")
+            title = str(item.get("title", "") or "").strip()
+            summary = str(item.get("summary", "") or "").strip()
+            summary_short = summary[:120] + ("..." if len(summary) > 120 else "")
+            paragraph_count = int(item.get("paragraph_count") or 0)
+            participants = ", ".join((item.get("participants") or [])[:4]) or "N/A"
+            lines.append(f"{idx}. {title}")
+            lines.append(f"   ID: {episode_id}")
+            lines.append(f"   摘要: {summary_short}")
+            lines.append(f"   参与者: {participants}")
+            lines.append(f"   段落数: {paragraph_count}")
+
         return True, "\n".join(lines)
 
     async def _query_entity(self, entity_name: str) -> Tuple[bool, str]:
@@ -616,6 +922,7 @@ class QueryCommand(BaseCommand):
             },
             "sparse": self.sparse_index.stats() if self.sparse_index else None,
             "relation_vectorization": {},
+            "runtime_self_check": None,
         }
         plugin_instance = self.plugin_config.get("plugin_instance")
         if plugin_instance is not None and hasattr(plugin_instance, "get_relation_vector_stats"):
@@ -623,20 +930,15 @@ class QueryCommand(BaseCommand):
                 stats["relation_vectorization"] = plugin_instance.get_relation_vector_stats()
             except Exception as e:
                 logger.warning(f"{self.log_prefix} 读取关系向量统计失败: {e}")
+        if plugin_instance is not None:
+            report = getattr(plugin_instance, "_runtime_self_check_report", None)
+            if isinstance(report, dict) and report:
+                stats["runtime_self_check"] = dict(report)
         
         # 获取知识类型分布
         type_distribution = {}
         if self.metadata_store:
-            cursor = self.metadata_store._conn.cursor()
-            cursor.execute("""
-                SELECT knowledge_type, COUNT(*) as count
-                FROM paragraphs
-                GROUP BY knowledge_type
-            """)
-            for row in cursor.fetchall():
-                type_name = row[0] if row[0] else "未分类"
-                count = row[1]
-                type_distribution[type_name] = count
+            type_distribution = self.metadata_store.get_knowledge_type_distribution()
 
         # 构建响应
         lines = [
@@ -685,6 +987,19 @@ class QueryCommand(BaseCommand):
                 f"  - vector_coverage: {vector_cov:.1f}%",
                 f"  - ready_but_missing_vector: {rel_vec_stats.get('ready_but_missing_vector', 0)}",
             ])
+
+        runtime_self_check = stats.get("runtime_self_check")
+        if isinstance(runtime_self_check, dict) and runtime_self_check:
+            lines.extend([
+                "",
+                "🩺 Runtime 自检:",
+                f"  - ok: {'是' if runtime_self_check.get('ok') else '否'}",
+                f"  - code: {runtime_self_check.get('code', 'unknown')}",
+                f"  - configured_dimension: {runtime_self_check.get('configured_dimension', 0)}",
+                f"  - vector_store_dimension: {runtime_self_check.get('vector_store_dimension', 0)}",
+                f"  - detected_dimension: {runtime_self_check.get('detected_dimension', 0)}",
+                f"  - encoded_dimension: {runtime_self_check.get('encoded_dimension', 0)}",
+            ])
         
         # 添加类型分布
         if type_distribution:
@@ -707,6 +1022,8 @@ class QueryCommand(BaseCommand):
 用法:
   /query search <查询文本>      - 检索相关内容（默认模式）
   /query time <k=v参数>         - 时间检索（支持语义+时间）
+  /query episode <k=v参数>      - 情景记忆检索（独立模式）
+  /query aggregate <k=v参数>    - 聚合检索（并发 search/time/episode，可选混合）
   /query entity <实体名称>      - 查询实体信息
   /query relation <关系规格>    - 查询关系信息
   /query person <id|别名>      - 查询人物画像
@@ -716,6 +1033,8 @@ class QueryCommand(BaseCommand):
 快捷模式:
   /query s <查询文本>           - 检索（search的简写）
   /query t <k=v参数>            - 时间检索（time的简写）
+  /query ep <k=v参数>           - 情景记忆检索（episode的简写）
+  /query ag <k=v参数>           - 聚合检索（aggregate的简写）
   /query e <实体名称>           - 实体查询（entity的简写）
   /query r <关系规格>           - 关系查询（relation的简写）
   /query p <id|别名>            - 人物画像（person的简写）
@@ -723,6 +1042,8 @@ class QueryCommand(BaseCommand):
 示例:
   /query search 人工智能的应用
   /query time q="项目进展" from=2025/01/01 to="2025/01/31 18:30"
+  /query episode q="项目复盘" from=2025/01/01 to=2025/01/31 top_k=5
+  /query aggregate q="项目复盘" from=2025/01/01 to=2025/01/31 top_k=5 mix=true
   /query entity Apple
   /query relation Apple|founded|Steve Jobs
   /query person id=7fa7f...
@@ -733,6 +1054,8 @@ class QueryCommand(BaseCommand):
 说明:
   - 检索模式会同时搜索段落和关系
   - time 模式参数: q/query, from/start, to/end, person, source, top_k
+  - episode 模式参数: q/query, from/start, to/end, person, source, top_k
+  - aggregate 模式参数: q/query, from/start, to/end, person, source, top_k, mix, mix_top_k, include_paragraphs
   - person 模式支持 id/person_id 参数或直接输入别名
   - time 格式仅支持 YYYY/MM/DD 或 YYYY/MM/DD HH:mm
   - 实体查询显示关联实体和相关段落

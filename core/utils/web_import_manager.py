@@ -23,8 +23,18 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from src.common.logger import get_logger
 from src.plugin_system.apis import llm_api
 
-from ..storage import detect_knowledge_type, KnowledgeType, MetadataStore
+from ..storage import (
+    parse_import_strategy,
+    resolve_stored_knowledge_type,
+    select_import_strategy,
+    KnowledgeType,
+    MetadataStore,
+)
+from ..storage.type_detection import looks_like_quote_text
+from ..utils.import_payloads import normalize_paragraph_import_item
+from ..utils.runtime_self_check import ensure_runtime_self_check
 from ..utils.time_parser import normalize_time_meta
+from ..storage.knowledge_types import ImportStrategy
 from ..strategies.base import ProcessedChunk, KnowledgeType as StrategyKnowledgeType
 from ..strategies.narrative import NarrativeStrategy
 from ..strategies.factual import FactualStrategy
@@ -148,6 +158,8 @@ def _storage_type_from_strategy(strategy_type: StrategyKnowledgeType) -> str:
         return KnowledgeType.NARRATIVE.value
     if strategy_type == StrategyKnowledgeType.FACTUAL:
         return KnowledgeType.FACTUAL.value
+    if strategy_type == StrategyKnowledgeType.QUOTE:
+        return KnowledgeType.QUOTE.value
     return KnowledgeType.MIXED.value
 
 
@@ -666,9 +678,10 @@ class ImportTaskManager:
         chunk_concurrency = _clamp(chunk_concurrency, 1, self._max_chunk_concurrency())
 
         llm_enabled = _coerce_bool(payload.get("llm_enabled", True), True)
-        strategy_override = str(payload.get("strategy_override", "auto") or "auto").strip().lower()
-        if strategy_override not in {"auto", "narrative", "factual", "quote"}:
-            raise ValueError("strategy_override 必须为 auto/narrative/factual/quote")
+        strategy_override = parse_import_strategy(
+            payload.get("strategy_override", "auto"),
+            default=ImportStrategy.AUTO,
+        ).value
 
         dedupe_policy = str(payload.get("dedupe_policy", default_dedupe) or default_dedupe).strip().lower()
         if dedupe_policy not in {"content_hash", "manifest", "none"}:
@@ -901,17 +914,10 @@ class ImportTaskManager:
 
         missing = _collect_missing()
         if missing:
-            sync_init = getattr(self.plugin, "_sync_initialize", None)
-            if callable(sync_init):
-                try:
-                    # 懒初始化兜底，兼容 Web 先启动、存储后初始化的场景
-                    sync_init()
-                except Exception as e:
-                    logger.warning(f"导入依赖懒初始化失败: {e}")
-                missing = _collect_missing()
-
-        if missing:
             raise ValueError(f"导入依赖未初始化: {', '.join(missing)}")
+        ready_checker = getattr(self.plugin, "is_runtime_ready", None)
+        if callable(ready_checker) and not ready_checker():
+            raise ValueError("插件运行时未就绪，请先完成 on_enable 初始化")
 
     def _scan_files(
         self,
@@ -2341,11 +2347,7 @@ class ImportTaskManager:
                     t.artifact_paths["backup_dir"] = str(backup_dir)
             self._cleanup_old_backups()
             try:
-                sync_init = getattr(self.plugin, "_sync_initialize", None)
-                if callable(sync_init):
-                    sync_init()
-                else:
-                    await self._reload_stores_after_external_migration()
+                await self._reload_stores_after_external_migration()
             except Exception as reload_err:
                 logger.warning(f"转换后重载存储失败: {reload_err}")
 
@@ -2398,35 +2400,13 @@ class ImportTaskManager:
         candidates = 0
         try:
             store.connect()
-            cursor = store._conn.cursor()
-            cursor.execute(
-                """
-                SELECT hash, created_at
-                FROM paragraphs
-                WHERE (event_time IS NULL AND event_time_start IS NULL AND event_time_end IS NULL)
-                ORDER BY created_at DESC
-                LIMIT ?
-                """,
-                (limit,),
+            summary = store.backfill_temporal_metadata_from_created_at(
+                limit=limit,
+                dry_run=dry_run,
+                no_created_fallback=no_created_fallback,
             )
-            rows = cursor.fetchall()
-            candidates = len(rows)
-            if not dry_run and not no_created_fallback:
-                for row in rows:
-                    created_at = row["created_at"]
-                    if created_at is None:
-                        continue
-                    cursor.execute(
-                        """
-                        UPDATE paragraphs
-                        SET event_time = ?, time_granularity = ?, time_confidence = ?, updated_at = ?
-                        WHERE hash = ?
-                        """,
-                        (float(created_at), "day", 0.2, float(created_at), row["hash"]),
-                    )
-                    if cursor.rowcount > 0:
-                        updated += 1
-                store._conn.commit()
+            candidates = int(summary.get("candidates", 0))
+            updated = int(summary.get("updated", 0))
         finally:
             try:
                 store.close()
@@ -2556,6 +2536,7 @@ class ImportTaskManager:
         )
         await self._set_file_strategy(task_id, file_record.file_id, strategy)
         await self._set_file_state(task_id, file_record.file_id, "splitting", "splitting")
+        await self._ensure_embedding_runtime_ready()
 
         chunks = strategy.split(content)
         selected_chunks = list(chunks)
@@ -2700,6 +2681,7 @@ class ImportTaskManager:
     ) -> None:
         await self._set_file_strategy(task_id, file_record.file_id, "json")
         await self._set_file_state(task_id, file_record.file_id, "splitting", "splitting")
+        await self._ensure_embedding_runtime_ready()
 
         try:
             data = json.loads(content)
@@ -2760,7 +2742,7 @@ class ImportTaskManager:
             paragraphs = data.get("paragraphs", [])
             for p in paragraphs:
                 if isinstance(p, dict) and any(
-                    key in p for key in ("entities", "relations", "time_meta", "source", "type")
+                    key in p for key in ("entities", "relations", "time_meta", "source", "type", "knowledge_type")
                 ):
                     return "script_json"
             return "web_json"
@@ -2804,58 +2786,25 @@ class ImportTaskManager:
                 }
                 paragraphs.append(para_item)
 
-        for idx, p in enumerate(paragraphs):
-            if isinstance(p, str):
-                units.append(
-                    {
-                        "chunk_id": f"{file_id}_json_{len(units)}",
-                        "kind": "paragraph",
-                        "content": p,
-                        "time_meta": None,
-                        "knowledge_type": detect_knowledge_type(p).value,
-                        "chunk_type": detect_knowledge_type(p).value,
-                        "source": f"web_import:{filename}",
-                        "entities": [],
-                        "relations": [],
-                        "preview": p[:120],
-                    }
-                )
-            elif isinstance(p, dict) and "content" in p:
-                content = str(p.get("content", ""))
-                raw_time_meta = {
-                    "event_time": p.get("event_time"),
-                    "event_time_start": p.get("event_time_start"),
-                    "event_time_end": p.get("event_time_end"),
-                    "time_range": p.get("time_range"),
-                    "time_granularity": p.get("time_granularity"),
-                    "time_confidence": p.get("time_confidence"),
+        for p in paragraphs:
+            paragraph = normalize_paragraph_import_item(
+                p,
+                default_source=f"web_import:{filename}",
+            )
+            units.append(
+                {
+                    "chunk_id": f"{file_id}_json_{len(units)}",
+                    "kind": "paragraph",
+                    "content": paragraph["content"],
+                    "time_meta": paragraph["time_meta"],
+                    "knowledge_type": paragraph["knowledge_type"],
+                    "chunk_type": paragraph["knowledge_type"],
+                    "source": paragraph["source"],
+                    "entities": paragraph["entities"],
+                    "relations": paragraph["relations"],
+                    "preview": paragraph["content"][:120],
                 }
-                if isinstance(p.get("time_meta"), dict):
-                    raw_time_meta.update(p.get("time_meta") or {})
-                k_type = str(p.get("knowledge_type") or p.get("type") or detect_knowledge_type(content).value)
-                local_relations: List[Dict[str, str]] = []
-                for rel in p.get("relations", []) or []:
-                    if not isinstance(rel, dict):
-                        continue
-                    s = str(rel.get("subject", "")).strip()
-                    pred = str(rel.get("predicate", "")).strip()
-                    o = str(rel.get("object", "")).strip()
-                    if s and pred and o:
-                        local_relations.append({"subject": s, "predicate": pred, "object": o})
-                units.append(
-                    {
-                        "chunk_id": f"{file_id}_json_{len(units)}",
-                        "kind": "paragraph",
-                        "content": content,
-                        "time_meta": normalize_time_meta(raw_time_meta),
-                        "knowledge_type": k_type,
-                        "chunk_type": k_type,
-                        "source": str(p.get("source") or f"web_import:{filename}"),
-                        "entities": [str(x) for x in (p.get("entities") or []) if str(x).strip()],
-                        "relations": local_relations,
-                        "preview": content[:120],
-                    }
-                )
+            )
 
         for e in entities:
             name = str(e or "").strip()
@@ -2938,7 +2887,10 @@ class ImportTaskManager:
                     kind = unit["kind"]
                     if kind == "paragraph":
                         content = str(unit.get("content", ""))
-                        k_type = str(unit.get("knowledge_type") or detect_knowledge_type(content).value)
+                        k_type = resolve_stored_knowledge_type(
+                            unit.get("knowledge_type"),
+                            content=content,
+                        ).value
                         source = str(unit.get("source") or f"web_import:{file_record.name}")
                         para_hash = self.plugin.metadata_store.add_paragraph(
                             content=content,
@@ -2977,6 +2929,18 @@ class ImportTaskManager:
         if file_record.source_path:
             return f"{file_record.source_kind}:{file_record.source_path}"
         return f"web_import:{file_record.name}"
+
+    async def _ensure_embedding_runtime_ready(self) -> None:
+        report = await ensure_runtime_self_check(self.plugin)
+        if bool(report.get("ok", False)):
+            return
+        raise RuntimeError(
+            "embedding runtime self-check failed: "
+            f"{report.get('message', 'unknown')} "
+            f"(configured={report.get('configured_dimension', 0)}, "
+            f"store={report.get('vector_store_dimension', 0)}, "
+            f"encoded={report.get('encoded_dimension', 0)})"
+        )
 
     async def _persist_processed_chunk(
         self,
@@ -3216,34 +3180,24 @@ JSON schema:
     def _chunk_rescue(self, chunk: ProcessedChunk, filename: str) -> Optional[Any]:
         if chunk.type == StrategyKnowledgeType.QUOTE:
             return None
-        text = chunk.chunk.text
-        lines = [l for l in text.split("\n") if l.strip()]
-        if not lines:
-            return None
-        avg_len = sum(len(l) for l in lines) / len(lines)
-        if avg_len < 25 and len(lines) > 4:
+        if looks_like_quote_text(chunk.chunk.text):
             return QuoteStrategy(filename)
         return None
 
-    def _determine_strategy(self, filename: str, content: str, override: str, *, chat_log: bool = False) -> Any:
-        if chat_log:
-            return NarrativeStrategy(filename)
-        if override == "narrative":
-            return NarrativeStrategy(filename)
-        if override == "factual":
+    def _instantiate_strategy(self, filename: str, strategy: ImportStrategy) -> Any:
+        if strategy == ImportStrategy.FACTUAL:
             return FactualStrategy(filename)
-        if override == "quote":
+        if strategy == ImportStrategy.QUOTE:
             return QuoteStrategy(filename)
-
-        head = content[:500]
-        lines = head.split("\n")
-        avg_len = sum(len(l) for l in lines if l.strip()) / (len(lines) + 1e-9)
-        if avg_len < 20 and len(lines) > 5:
-            return QuoteStrategy(filename)
-        if "Chapter" in head or "CHAPTER" in head or "###" in head:
-            return NarrativeStrategy(filename)
-
         return NarrativeStrategy(filename)
+
+    def _determine_strategy(self, filename: str, content: str, override: str, *, chat_log: bool = False) -> Any:
+        strategy = select_import_strategy(
+            content,
+            override=override,
+            chat_log=chat_log,
+        )
+        return self._instantiate_strategy(filename, strategy)
 
     async def _set_file_strategy(self, task_id: str, file_id: str, strategy: Any) -> None:
         if isinstance(strategy, str):

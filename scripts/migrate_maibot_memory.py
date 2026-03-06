@@ -774,12 +774,12 @@ class MigrationRunner:
             self.embedding_manager = None
 
         q_type = str(emb_cfg.get("quantization_type", "int8")).lower()
-        q_map = {
-            "float32": QuantizationType.FLOAT32,
-            "int8": QuantizationType.INT8,
-            "pq": QuantizationType.PQ,
-        }
-        quantization = q_map.get(q_type, QuantizationType.INT8)
+        if q_type != "int8":
+            raise MigrationError(
+                "embedding.quantization_type 在 vNext 仅允许 int8(SQ8)。"
+                " 请先执行 scripts/release_vnext_migrate.py migrate。"
+            )
+        quantization = QuantizationType.INT8
 
         matrix_fmt = str(graph_cfg.get("sparse_matrix_format", "csr")).lower()
         fmt_map = {
@@ -1169,9 +1169,7 @@ class MigrationRunner:
         now_ts = time.time()
         empty_meta_blob = pickle.dumps({})
 
-        conn = self.metadata_store._conn
-        if conn is None:
-            raise MigrationError("metadata_store 连接不可用")
+        conn = self.metadata_store.get_connection()
 
         cursor = conn.cursor()
 

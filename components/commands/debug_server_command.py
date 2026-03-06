@@ -11,8 +11,8 @@ class DebugServerCommand(BaseCommand):
 
     async def execute(self):
         try:
-            from ...plugin import _get_global_instance
-            plugin = _get_global_instance()
+            from ...plugin import A_MemorixPlugin
+            plugin = A_MemorixPlugin.get_global_instance()
             
             if not plugin:
                 return True, "❌ 无法获取插件实例", 0
@@ -23,12 +23,12 @@ class DebugServerCommand(BaseCommand):
 
             # 先确保核心存储已初始化，避免只启动了 WebUI 但导入依赖为空
             if not getattr(plugin, "_initialized", False):
-                status.append("Storage not initialized, trying _sync_initialize() ...")
+                status.append("Storage not initialized, trying async initialization ...")
                 try:
-                    plugin._sync_initialize()
+                    await plugin._ensure_initialized()
                     status.append(f"Storage initialized: {plugin._initialized}")
                 except Exception as e:
-                    status.append(f"❌ _sync_initialize failed: {e}")
+                    status.append(f"❌ _ensure_initialized failed: {e}")
 
             # 尝试强制启动
             if not plugin.server:

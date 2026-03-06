@@ -25,6 +25,27 @@ PROJECT_ROOT = PLUGIN_ROOT.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PLUGIN_ROOT))
 
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="审计 A_Memorix 向量一致性")
+    parser.add_argument(
+        "--data-dir",
+        default=str(PLUGIN_ROOT / "data"),
+        help="A_Memorix 数据目录（默认: plugins/A_memorix/data）",
+    )
+    parser.add_argument("--json-out", default="", help="可选：输出 JSON 文件路径")
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="若发现一致性异常则返回非 0 退出码",
+    )
+    return parser
+
+
+# --help/-h fast path: avoid heavy host/plugin bootstrap
+if any(arg in {"-h", "--help"} for arg in sys.argv[1:]):
+    _build_arg_parser().print_help()
+    sys.exit(0)
+
 try:
     from core.storage.vector_store import VectorStore
     from core.storage.metadata_store import MetadataStore
@@ -66,28 +87,11 @@ def _load_metadata_store(data_dir: Path) -> MetadataStore:
 
 
 def _hash_set(metadata_store: MetadataStore, table: str) -> Set[str]:
-    rows = metadata_store.query(f"SELECT hash FROM {table}")
-    return {str(row["hash"]) for row in rows}
+    return {str(h) for h in metadata_store.list_hashes(table)}
 
 
 def _relation_state_stats(metadata_store: MetadataStore) -> Dict[str, int]:
-    if hasattr(metadata_store, "count_relations_by_vector_state"):
-        return metadata_store.count_relations_by_vector_state()
-
-    rows = metadata_store.query(
-        """
-        SELECT COALESCE(vector_state, 'none') AS state, COUNT(*) AS cnt
-        FROM relations
-        GROUP BY COALESCE(vector_state, 'none')
-        """
-    )
-    stats: Dict[str, int] = {"none": 0, "pending": 0, "ready": 0, "failed": 0, "total": 0}
-    for row in rows:
-        state = str(row["state"] or "none").lower()
-        cnt = int(row["cnt"] or 0)
-        stats[state] = stats.get(state, 0) + cnt
-        stats["total"] += cnt
-    return stats
+    return metadata_store.count_relations_by_vector_state()
 
 
 def run_audit(data_dir: Path) -> Dict[str, Any]:
@@ -109,14 +113,12 @@ def run_audit(data_dir: Path) -> Dict[str, Any]:
             live_vector_hashes - paragraph_hashes - entity_hashes - relation_hashes
         )
 
-        relation_rows = metadata_store.query(
-            "SELECT hash, COALESCE(vector_state, 'none') AS vector_state FROM relations"
-        )
+        relation_rows = metadata_store.get_relations()
         ready_but_missing = 0
         not_ready_but_present = 0
         for row in relation_rows:
-            h = str(row["hash"])
-            state = str(row["vector_state"] or "none").lower()
+            h = str(row.get("hash") or "")
+            state = str(row.get("vector_state") or "none").lower()
             in_vector = h in live_vector_hashes
             if state == "ready" and not in_vector:
                 ready_but_missing += 1
@@ -156,18 +158,7 @@ def run_audit(data_dir: Path) -> Dict[str, Any]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="审计 A_Memorix 向量一致性")
-    parser.add_argument(
-        "--data-dir",
-        default=str(PLUGIN_ROOT / "data"),
-        help="A_Memorix 数据目录（默认: plugins/A_memorix/data）",
-    )
-    parser.add_argument("--json-out", default="", help="可选：输出 JSON 文件路径")
-    parser.add_argument(
-        "--strict",
-        action="store_true",
-        help="若发现一致性异常则返回非 0 退出码",
-    )
+    parser = _build_arg_parser()
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir).resolve()

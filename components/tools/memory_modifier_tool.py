@@ -108,9 +108,10 @@ class MemoryModifierTool(BaseTool):
         
         if target_type == "relation":
              # 简单实现：使用 query 模糊搜索 relations
-             results = self.metadata_store.query(
-                 "SELECT * FROM relations WHERE subject LIKE ? OR object LIKE ? LIMIT 5",
-                 (f"%{query}%", f"%{query}%")
+             results = self.metadata_store.search_relations_by_subject_or_object(
+                 str(query or ""),
+                 limit=5,
+                 include_deleted=False,
              )
              found_items = results
         

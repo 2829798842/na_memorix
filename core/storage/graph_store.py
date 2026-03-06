@@ -311,7 +311,6 @@ class GraphStore:
             self._adjacency = self._adjacency.tocsr()
 
         self._total_edges_added += len(edges)
-        self._total_edges_added += len(edges)
         self._adjacency_dirty = True  # 标记脏位
         
         # V5: 更新边哈希映射 (Edge Hash Map)
@@ -622,6 +621,80 @@ class GraphStore:
 
         return float(self._adjacency[src_idx, tgt_idx])
 
+    def canonicalize_node(self, node: str) -> str:
+        """公开节点规范化接口，避免外部访问私有方法。"""
+        return self._canonicalize(node)
+
+    def has_edge_hash_map(self) -> bool:
+        """是否存在 relation-hash 映射。"""
+        return bool(self._edge_hash_map)
+
+    def get_relation_hashes_for_edge(self, source: str, target: str) -> Set[str]:
+        """获取边 (source -> target) 关联的关系哈希集合。"""
+        src_canon = self._canonicalize(source)
+        tgt_canon = self._canonicalize(target)
+        if src_canon not in self._node_to_idx or tgt_canon not in self._node_to_idx:
+            return set()
+        src_idx = self._node_to_idx[src_canon]
+        tgt_idx = self._node_to_idx[tgt_canon]
+        return set(self._edge_hash_map.get((src_idx, tgt_idx), set()))
+
+    def get_incident_relation_hashes(self, node: str, limit: Optional[int] = None) -> List[str]:
+        """获取与指定节点关联的关系哈希列表（入边 + 出边）。"""
+        canon = self._canonicalize(node)
+        if canon not in self._node_to_idx or not self._edge_hash_map:
+            return []
+
+        idx = self._node_to_idx[canon]
+        limit_val = max(1, int(limit)) if limit is not None else None
+        collected: List[Tuple[str, str, str]] = []
+        idx_to_node = self._nodes
+
+        for (src_idx, tgt_idx), hashes in self._edge_hash_map.items():
+            if idx not in {src_idx, tgt_idx}:
+                continue
+            src_name = idx_to_node[src_idx] if 0 <= src_idx < len(idx_to_node) else ""
+            tgt_name = idx_to_node[tgt_idx] if 0 <= tgt_idx < len(idx_to_node) else ""
+            for hash_value in hashes:
+                hash_text = str(hash_value).strip()
+                if not hash_text:
+                    continue
+                collected.append((src_name, tgt_name, hash_text))
+
+        collected.sort(key=lambda x: (x[0].lower(), x[1].lower(), x[2]))
+        out: List[str] = []
+        seen = set()
+        for _, _, hash_value in collected:
+            if hash_value in seen:
+                continue
+            seen.add(hash_value)
+            out.append(hash_value)
+            if limit_val is not None and len(out) >= limit_val:
+                break
+        return out
+
+    def edge_contains_relation_hash(self, source: str, target: str, hash_value: str) -> bool:
+        """判断边是否包含指定关系哈希。"""
+        if not hash_value:
+            return False
+        return str(hash_value) in self.get_relation_hashes_for_edge(source, target)
+
+    def iter_edge_hash_entries(self) -> List[Tuple[str, str, Set[str]]]:
+        """以节点名形式遍历 edge-hash-map。"""
+        out: List[Tuple[str, str, Set[str]]] = []
+        if not self._edge_hash_map:
+            return out
+        idx_to_node = self._nodes
+        for (s_idx, t_idx), hashes in self._edge_hash_map.items():
+            if not hashes:
+                continue
+            if s_idx < 0 or t_idx < 0:
+                continue
+            if s_idx >= len(idx_to_node) or t_idx >= len(idx_to_node):
+                continue
+            out.append((idx_to_node[s_idx], idx_to_node[t_idx], set(hashes)))
+        return out
+
     def deactivate_edges(self, edges: List[Tuple[str, str]]) -> int:
         """
         冻结边 (将权重设为0.0，使其在计算意义上消失，但保留在Map中)
@@ -656,14 +729,28 @@ class GraphStore:
 
         if self._adjacency_dirty or self._adjacency_T is None:
             # 只有在确实需要时才计算转置
-            # 注意：在 incremental 模式下 (LIL)，转置可能比较慢
-            if self._modification_mode == GraphModificationMode.INCREMENTAL:
-                 self._adjacency_T = self._adjacency.transpose().tocsr() # 转为 CSR 优化读
-            else:
-                 self._adjacency_T = self._adjacency.transpose()
+            # find_paths 以“按行读取邻居”为主，因此统一缓存为 CSR，避免
+            # CSR->CSC 转置后按行切片读出错误的索引视图。
+            self._adjacency_T = self._adjacency.transpose().tocsr()
             
             self._adjacency_dirty = False
             # logger.debug("重建转置邻接矩阵缓存")
+
+    @staticmethod
+    def _row_neighbor_indices(
+        matrix: Optional[Union[csr_matrix, csc_matrix]],
+        row_idx: int,
+    ) -> np.ndarray:
+        """返回指定行的非零列索引。"""
+        if matrix is None:
+            return np.asarray([], dtype=np.int32)
+
+        if isinstance(matrix, csr_matrix):
+            return matrix.indices[matrix.indptr[row_idx]:matrix.indptr[row_idx + 1]]
+
+        row = matrix[row_idx, :]
+        _, indices = row.nonzero()
+        return np.asarray(indices, dtype=np.int32)
 
     def find_paths(
         self, 
@@ -687,7 +774,10 @@ class GraphStore:
         Returns:
             路径列表 [[n1, n2, n3], ...]
         """
-        if start_node not in self._node_to_idx or end_node not in self._node_to_idx:
+        start_canon = self._canonicalize(start_node)
+        end_canon = self._canonicalize(end_node)
+
+        if start_canon not in self._node_to_idx or end_canon not in self._node_to_idx:
             return []
             
         if self._adjacency is None:
@@ -696,8 +786,8 @@ class GraphStore:
         # 确保转置矩阵可用 (用于查找入边)
         self._ensure_adjacency_T()
         
-        start_idx = self._node_to_idx[start_node]
-        end_idx = self._node_to_idx[end_node]
+        start_idx = self._node_to_idx[start_canon]
+        end_idx = self._node_to_idx[end_canon]
         
         # 队列: (current_idx, path_indices)
         queue = [(start_idx, [start_idx])]
@@ -731,28 +821,11 @@ class GraphStore:
             expansions += 1
             
             # 获取邻居 (出边 + 入边)
-            # 1. 出边
-            if self.matrix_format == "csr":
-                out_indices = self._adjacency.indices[self._adjacency.indptr[curr]:self._adjacency.indptr[curr+1]]
-            else:
-                # 兼容其他格式，虽然慢一点
-                row = self._adjacency[curr, :]
-                if hasattr(row, 'indices'):
-                     out_indices = row.indices
-                else:
-                     _, out_indices = row.nonzero()
+            out_indices = self._row_neighbor_indices(self._adjacency, curr)
             
             # 2. 入边 (使用转置矩阵)
             if self._adjacency_T is not None:
-                if isinstance(self._adjacency_T, csr_matrix): # CSR based
-                     in_indices = self._adjacency_T.indices[self._adjacency_T.indptr[curr]:self._adjacency_T.indptr[curr+1]]
-                else:
-                     row = self._adjacency_T[curr, :]
-                     if hasattr(row, 'indices'): # csr/csc
-                          in_indices = row.indices
-                     else:
-                          _, in_indices = row.nonzero()
-                     
+                in_indices = self._row_neighbor_indices(self._adjacency_T, curr)
                 neighbors = np.concatenate((out_indices, in_indices))
             else:
                 neighbors = out_indices
@@ -760,11 +833,14 @@ class GraphStore:
             # 去重并过滤已在路径中的节点 (防止环)
             # 注意: 这里简单去重，可能包含重复的邻居(如果既是出又是入)
             seen_in_path = set(path)
+            queued_neighbors = set()
             
             for neighbor_idx in neighbors:
-                if neighbor_idx not in seen_in_path:
+                neighbor = int(neighbor_idx)
+                if neighbor not in seen_in_path and neighbor not in queued_neighbors:
                     # 只有未访问过的才加入
-                    queue.append((neighbor_idx, path + [neighbor_idx]))
+                    queue.append((neighbor, path + [neighbor]))
+                    queued_neighbors.add(neighbor)
                     
         return found_paths
 
@@ -1062,6 +1138,7 @@ class GraphStore:
         self._node_to_idx.clear()
         self._node_attrs.clear()
         self._adjacency = None
+        self._edge_hash_map.clear()
         self._adjacency_T = None
         self._adjacency_dirty = True
         self._total_nodes_added = 0

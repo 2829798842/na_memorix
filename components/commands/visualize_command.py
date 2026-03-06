@@ -83,8 +83,8 @@ class VisualizeCommand(BaseCommand):
         
         try:
             # 尝试获取全局实例的配置
-            from ...plugin import _get_global_instance
-            plugin = _get_global_instance()
+            from ...plugin import A_MemorixPlugin
+            plugin = A_MemorixPlugin.get_global_instance()
             
             if plugin:
                 enabled = plugin.get_config("web.enabled", True)

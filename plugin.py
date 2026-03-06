@@ -4,9 +4,7 @@ A_Memorix 插件主入口
 完全独立的轻量级知识库插件，提供低资源环境下的高效知识存储与检索。
 """
 
-import sys
 import inspect
-from pathlib import Path
 from typing import List, Tuple, Type, Optional, Dict, Union, Any, Set, Callable, Awaitable
 from src.plugin_system import (
     BasePlugin,
@@ -22,16 +20,10 @@ from src.plugin_system import (
     EventType,
     MaiMessages,
     CustomEventHandlerResult,
-    ConfigField,
     register_plugin,
 )
 from src.common.logger import get_logger
 import asyncio
-import uuid
-import time
-import json
-import datetime
-from .core.utils.io import atomic_write
 
 try:
     # 旧版的麦麦有这个工具函数，新版的没有了，做个兼容
@@ -46,23 +38,41 @@ from .core import (
     GraphStore,
     MetadataStore,
     EmbeddingAPIAdapter,
-    create_embedding_api_adapter,
     SparseBM25Index,
-    SparseBM25Config,
-    FusionConfig,
     RelationWriteService,
 )
+from .core.config.plugin_config_schema import (
+    config_schema as PLUGIN_CONFIG_SCHEMA,
+    config_section_descriptions as PLUGIN_CONFIG_SECTION_DESCRIPTIONS,
+)
+from .core.runtime import RequestRouter
+from .core.runtime.lifecycle_orchestrator import (
+    cancel_background_tasks as cancel_background_tasks_runtime,
+    ensure_initialized as ensure_initialized_runtime,
+    initialize_storage_async as initialize_storage_async_runtime,
+    start_background_tasks as start_background_tasks_runtime,
+)
+from .core.runtime.maintenance_tasks import (
+    auto_save_loop as auto_save_loop_runtime,
+    cleanup_orphan_relation_vectors as cleanup_orphan_relation_vectors_runtime,
+    episode_generation_loop as episode_generation_loop_runtime,
+    get_relation_vector_stats as get_relation_vector_stats_runtime,
+    memory_maintenance_loop as memory_maintenance_loop_runtime,
+    orphan_gc_phase as orphan_gc_phase_runtime,
+    perform_bulk_summary_import as perform_bulk_summary_import_runtime,
+    person_profile_refresh_loop as person_profile_refresh_loop_runtime,
+    process_freeze_and_prune as process_freeze_and_prune_runtime,
+    process_reinforce_batch as process_reinforce_batch_runtime,
+    refresh_person_profiles_for_enabled_switches as refresh_profiles_runtime,
+    relation_vector_backfill_loop as relation_vector_backfill_loop_runtime,
+    reinforce_access as reinforce_access_runtime,
+    save_all as save_all_runtime,
+    scheduled_import_loop as scheduled_import_loop_runtime,
+    update_manifest as update_manifest_runtime,
+)
+from .core.utils import PluginIdPolicy
 
 logger = get_logger("A_Memorix")
-
-
-# 插件实例全局引用（由组件兜底使用）
-# 使用 sys.modules 存储以解决由于不同路径导入导致的多个模块副本问题
-def _set_global_instance(instance):
-    sys.modules["A_MEMORIX_GLOBAL_INSTANCE"] = instance
-
-def _get_global_instance():
-    return sys.modules.get("A_MEMORIX_GLOBAL_INSTANCE")
 
 
 def _to_builtin_data_compat(value: Any) -> Any:
@@ -99,16 +109,23 @@ def _to_builtin_data_compat(value: Any) -> Any:
     return value
 
 
-def _is_a_memorix_plugin_id(plugin_id: Any) -> bool:
-    """兼容插件名与带命名空间的插件ID（如 A_Dawn.A_memorix）。"""
-    if not isinstance(plugin_id, str):
-        return False
-    normalized = plugin_id.strip().lower()
-    if not normalized:
-        return False
-    if normalized == "a_memorix":
-        return True
-    return normalized.split(".")[-1] == "a_memorix"
+def _resolve_loaded_plugin_instance(plugin_name: str) -> Optional["A_MemorixPlugin"]:
+    """Resolve plugin instance via plugin_manager only (no global singleton fallback)."""
+    try:
+        from src.plugin_system.core.plugin_manager import plugin_manager
+
+        direct = plugin_manager.get_plugin_instance(plugin_name)
+        if direct is not None:
+            return direct
+
+        for loaded_name in plugin_manager.list_loaded_plugins():
+            if PluginIdPolicy.is_target_plugin_id(loaded_name):
+                instance = plugin_manager.get_plugin_instance(loaded_name)
+                if instance is not None:
+                    return instance
+    except Exception:
+        return None
+    return None
 
 
 def _patch_webui_a_memorix_routes_for_tomlkit_serialization() -> None:
@@ -186,7 +203,7 @@ def _patch_webui_a_memorix_routes_for_tomlkit_serialization() -> None:
                 except Exception:
                     plugin_id = kwargs.get("plugin_id")
 
-                if not _is_a_memorix_plugin_id(plugin_id) or not isinstance(result, dict):
+                if not PluginIdPolicy.is_target_plugin_id(plugin_id) or not isinstance(result, dict):
                     return result
 
                 patched = dict(result)
@@ -225,9 +242,7 @@ class A_MemorixStartHandler(BaseEventHandler):
     async def execute(
         self, message: MaiMessages | None
     ) -> Tuple[bool, bool, Optional[str], Optional[CustomEventHandlerResult], Optional[MaiMessages]]:
-        from src.plugin_system.core.plugin_manager import plugin_manager
-
-        plugin = plugin_manager.get_plugin_instance(self.plugin_name) or _get_global_instance()
+        plugin = _resolve_loaded_plugin_instance(self.plugin_name)
         if plugin is None:
             logger.warning("A_Memorix ON_START: 未找到插件实例，跳过 on_enable")
             return True, True, "A_Memorix 实例缺失", None, None
@@ -250,9 +265,7 @@ class A_MemorixStopHandler(BaseEventHandler):
     async def execute(
         self, message: MaiMessages | None
     ) -> Tuple[bool, bool, Optional[str], Optional[CustomEventHandlerResult], Optional[MaiMessages]]:
-        from src.plugin_system.core.plugin_manager import plugin_manager
-
-        plugin = plugin_manager.get_plugin_instance(self.plugin_name) or _get_global_instance()
+        plugin = _resolve_loaded_plugin_instance(self.plugin_name)
         if plugin is None:
             logger.warning("A_Memorix ON_STOP: 未找到插件实例，跳过 on_disable")
             return True, True, "A_Memorix 实例缺失", None, None
@@ -281,7 +294,7 @@ class A_MemorixPlugin(BasePlugin):
 
     # 插件基本信息（PluginBase要求的抽象属性）
     plugin_name = "A_Memorix"
-    plugin_version = "0.7.0"
+    plugin_version = "1.0.0"
     plugin_description = "轻量级知识库插件 - 含人物画像能力的独立记忆增强系统"
     plugin_author = "A_Dawn"
     enable_plugin = False  # 默认禁用，需要在config.toml中启用
@@ -303,471 +316,17 @@ class A_MemorixPlugin(BasePlugin):
     config_file_name: str = "config.toml"
 
     # 配置节描述
-    config_section_descriptions = {
-        "plugin": "插件基本信息",
-        "storage": "存储配置",
-        "embedding": "嵌入模型配置",
-        "retrieval": "检索配置",
-        "threshold": "阈值策略配置",
-        "graph": "知识图谱配置",
-        "web": "可视化服务器配置",
-        "advanced": "高级配置",
-        "summarization": "总结与导入配置",
-        "schedule": "定时任务配置",
-        "filter": "消息过滤配置",
-        "routing": "检索路由与兼容开关",
-        "person_profile": "人物画像配置",
-        "memory": "记忆衰减与强化配置",
-    }
+    config_section_descriptions = PLUGIN_CONFIG_SECTION_DESCRIPTIONS
 
     # 配置Schema定义
-    config_schema: dict = {
-        "plugin": {
-            "config_version": ConfigField(
-                type=str,
-                default="4.1.0",
-                description="配置文件版本"
-            ),
-            "enabled": ConfigField(
-                type=bool,
-                default=False,
-                description="是否启用插件"
-            ),
-        },
-        "storage": {
-            "data_dir": ConfigField(
-                type=str,
-                default="./data",  # Changed to relative path default
-                description="数据目录（默认为插件目录下的 data）"
-            ),
-        },
-        "embedding": {
-            "dimension": ConfigField(
-                type=int,
-                default=1024,
-                description="向量维度 (对于支持动态维度的模型，将尝试请求此维度)"
-            ),
-            "quantization_type": ConfigField(
-                type=str,
-                default="int8",
-                description="量化类型: float32, int8, pq"
-            ),
-            "batch_size": ConfigField(
-                type=int,
-                default=32,
-                description="批量生成嵌入的批次大小"
-            ),
-            "max_concurrent": ConfigField(
-                type=int,
-                default=5,
-                description="嵌入API最大并发请求数"
-            ),
-            "model_name": ConfigField(
-                type=str,
-                default="auto",
-                description="指定嵌入模型名称 (对应 model_config.toml 中的 name)"
-            ),
-            "retry": ConfigField(
-                type=dict,
-                default={
-                    "max_attempts": 5,
-                    "max_wait_seconds": 40,
-                    "min_wait_seconds": 3,
-                    "backoff_multiplier": 3,
-                },
-                description="嵌入重试配置: max_attempts, min_wait_seconds, max_wait_seconds, backoff_multiplier"
-            ),
-        },
-        "retrieval": {
-            "top_k_relations": ConfigField(
-                type=int,
-                default=10,
-                description="关系检索返回数量"
-            ),
-            "top_k_paragraphs": ConfigField(
-                type=int,
-                default=20,
-                description="段落检索返回数量"
-            ),
-            "alpha": ConfigField(
-                type=float,
-                default=0.5,
-                description="双路检索融合权重 (0:仅关系, 1:仅段落)"
-            ),
-            "enable_ppr": ConfigField(
-                type=bool,
-                default=True,
-                description="是否启用 Personalized PageRank 重排序"
-            ),
-            "ppr_alpha": ConfigField(
-                type=float,
-                default=0.85,
-                description="PPR的alpha参数"
-            ),
-            "ppr_concurrency_limit": ConfigField(
-                type=int,
-                default=4,
-                description="PPR计算的最大并发数"
-            ),
-            "enable_parallel": ConfigField(
-                type=bool,
-                default=True,
-                description="是否启用并行检索"
-            ),
-            "relation_semantic_fallback": ConfigField(
-                type=bool,
-                default=True,
-                description="是否启用关系查询的语义回退（支持自然语言查询）"
-            ),
-            "relation_fallback_min_score": ConfigField(
-                type=float,
-                default=0.3,
-                description="关系语义回退的最小相似度阈值"
-            ),
-            "temporal": ConfigField(
-                type=dict,
-                default={
-                    "enabled": True,
-                    "allow_created_fallback": True,
-                    "candidate_multiplier": 8,
-                    "default_top_k": 10,
-                    "max_scan": 1000,
-                },
-                description="时序检索配置"
-            ),
-            "search": ConfigField(
-                type=dict,
-                default={
-                    "smart_fallback": {
-                        "enabled": True,
-                        "threshold": 0.6,
-                    },
-                    "safe_content_dedup": {
-                        "enabled": True,
-                    },
-                    "relation_intent": {
-                        "enabled": True,
-                        "alpha_override": 0.35,
-                        "relation_candidate_multiplier": 4,
-                        "preserve_top_relations": 3,
-                        "force_relation_sparse": True,
-                        "pair_predicate_rerank_enabled": True,
-                        "pair_predicate_limit": 3,
-                    },
-                },
-                description="统一检索后处理配置（smart fallback / safe dedup）"
-            ),
-            "relation_vectorization": ConfigField(
-                type=dict,
-                default={
-                    "enabled": False,
-                    "write_on_import": True,
-                    "backfill_enabled": False,
-                    "backfill_batch_size": 200,
-                    "backfill_interval_seconds": 5,
-                    "max_retry": 3,
-                },
-                description="关系向量化配置（写入与后台回填）"
-            ),
-            "time": ConfigField(
-                type=dict,
-                default={
-                    "skip_threshold_when_query_empty": True,
-                },
-                description="time 模式行为兼容配置"
-            ),
-            "sparse": ConfigField(
-                type=dict,
-                default={
-                    "enabled": True,
-                    "backend": "fts5",
-                    "lazy_load": True,
-                    "mode": "auto",
-                    "tokenizer_mode": "jieba",
-                    "jieba_user_dict": "",
-                    "char_ngram_n": 2,
-                    "candidate_k": 80,
-                    "max_doc_len": 2000,
-                    "enable_ngram_fallback_index": True,
-                    "enable_like_fallback": False,
-                    "enable_relation_sparse_fallback": True,
-                    "relation_candidate_k": 60,
-                    "relation_max_doc_len": 512,
-                    "unload_on_disable": True,
-                    "shrink_memory_on_unload": True,
-                },
-                description="稀疏检索配置（FTS5 + BM25）"
-            ),
-            "fusion": ConfigField(
-                type=dict,
-                default={
-                    "method": "weighted_rrf",
-                    "rrf_k": 60,
-                    "vector_weight": 0.7,
-                    "bm25_weight": 0.3,
-                    "normalize_score": True,
-                    "normalize_method": "minmax",
-                },
-                description="检索融合配置"
-            ),
-        },
-        "threshold": {
-            "min_threshold": ConfigField(
-                type=float,
-                default=0.3,
-                description="搜索结果的最小阈值"
-            ),
-            "max_threshold": ConfigField(
-                type=float,
-                default=0.95,
-                description="搜索结果的最大阈值"
-            ),
-            "percentile": ConfigField(
-                type=float,
-                default=75.0,
-                description="动态阈值的分位数"
-            ),
-            "std_multiplier": ConfigField(
-                type=float,
-                default=1.5,
-                description="标准差倍数（用于异常值过滤）"
-            ),
-            "min_results": ConfigField(
-                type=int,
-                default=3,
-                description="即使未达标也强制返回的最小结果数"
-            ),
-            "enable_auto_adjust": ConfigField(
-                type=bool,
-                default=True,
-                description="是否根据结果分布自动调整阈值"
-            ),
-        },
-        "graph": {
-            "sparse_matrix_format": ConfigField(
-                type=str,
-                default="csr",
-                description="稀疏矩阵存储格式: csr, csc"
-            ),
-        },
-        "web": {
-            "enabled": ConfigField(
-                type=bool,
-                default=True,
-                description="是否启用可视化编辑服务器"
-            ),
-            "port": ConfigField(
-                type=int,
-                default=8082,
-                description="服务器端口"
-            ),
-            "host": ConfigField(
-                type=str,
-                default="0.0.0.0",
-                description="服务器绑定地址"
-            ),
-            "import": ConfigField(
-                type=dict,
-                default={
-                    "enabled": True,
-                    "max_queue_size": 20,
-                    "max_files_per_task": 200,
-                    "max_file_size_mb": 20,
-                    "max_paste_chars": 200000,
-                    "default_file_concurrency": 2,
-                    "default_chunk_concurrency": 4,
-                    "max_file_concurrency": 6,
-                    "max_chunk_concurrency": 12,
-                    "poll_interval_ms": 1000,
-                    "token": "",
-                    "path_aliases": {
-                        "raw": "./plugins/A_memorix/data/raw",
-                        "lpmm": "./data/lpmm_storage",
-                        "plugin_data": "./plugins/A_memorix/data",
-                    },
-                    "llm_retry": {
-                        "max_attempts": 4,
-                        "min_wait_seconds": 3,
-                        "max_wait_seconds": 40,
-                        "backoff_multiplier": 3,
-                    },
-                    "convert": {
-                        "enable_staging_switch": True,
-                        "keep_backup_count": 3,
-                    },
-                },
-                description="Web 导入中心配置（队列、并发、大小限制、鉴权）"
-            ),
-        },
-        "advanced": {
-            "enable_auto_save": ConfigField(
-                type=bool,
-                default=True,
-                description="启用自动保存（原子化统一持久化）"
-            ),
-            "auto_save_interval_minutes": ConfigField(
-                type=int,
-                default=5,
-                description="自动保存间隔（分钟）"
-            ),
-            "debug": ConfigField(
-                type=bool,
-                default=False,
-                description="启用详细调试日志"
-            ),
-            "extraction_model": ConfigField(
-                type=str,
-                default="auto",
-                description="指定知识抽取模型名称 (对应 model_config.toml 中的 name)"
-            ),
-        },
-        "summarization": {
-            "enabled": ConfigField(
-                type=bool,
-                default=True,
-                description="是否启用总结导入功能"
-            ),
-            "model_name": ConfigField(
-                type=str,
-                default="auto",
-                description="总结使用的模型选择器（支持 auto/任务名/模型名；也可在配置文件中使用数组）"
-            ),
-            "context_length": ConfigField(
-                type=int,
-                default=50,
-                description="总结消息的上下文条数"
-            ),
-            "include_personality": ConfigField(
-                type=bool,
-                default=True,
-                description="总结提示词是否包含机器人人设"
-            ),
-            "default_knowledge_type": ConfigField(
-                type=str,
-                default="narrative",
-                description="总结导入时的默认知识类型"
-            ),
-        },
-        "schedule": {
-            "enabled": ConfigField(
-                type=bool,
-                default=True,
-                description="是否启用定时自动导入"
-            ),
-            "import_times": ConfigField(
-                type=list,
-                default=["04:00"],
-                description="每日自动导入的时间点列表 (24小时制, 如 ['04:00', '16:00'])"
-            ),
-        },
-        "filter": {
-            "enabled": ConfigField(
-                type=bool,
-                default=True,
-                description="是否启用聊天流过滤"
-            ),
-            "mode": ConfigField(
-                type=str,
-                default="whitelist",
-                description="过滤模式：whitelist(白名单) 或 blacklist(黑名单)"
-            ),
-            "chats": ConfigField(
-                type=list,
-                default=[],
-                description="聊天流 ID 列表。支持填写: 1. 群号 (group_id, 如: 123456); 2. 私聊用户ID (user_id, 如: 10001); 3. 聊天流唯一标识 (stream_id, MD5格式)。"
-            ),
-        },
-        "routing": {
-            "search_owner": ConfigField(
-                type=str,
-                default="action",
-                description="search/time 主责入口：action|tool|dual"
-            ),
-            "tool_search_mode": ConfigField(
-                type=str,
-                default="forward",
-                description="knowledge_query 的 search/time 模式：forward|disabled（legacy 兼容别名）"
-            ),
-            "enable_request_dedup": ConfigField(
-                type=bool,
-                default=True,
-                description="是否启用短时请求去重（抑制 Action+Tool 同轮重复检索）"
-            ),
-            "request_dedup_ttl_seconds": ConfigField(
-                type=int,
-                default=2,
-                description="请求去重 TTL（秒）"
-            ),
-        },
-        "person_profile": {
-            "enabled": ConfigField(
-                type=bool,
-                default=True,
-                description="人物画像模块总开关"
-            ),
-            "opt_in_required": ConfigField(
-                type=bool,
-                default=True,
-                description="是否要求用户显式开启（默认开启显式开关模式）"
-            ),
-            "default_injection_enabled": ConfigField(
-                type=bool,
-                default=False,
-                description="当不存在用户开关记录时的默认注入状态"
-            ),
-            "profile_ttl_minutes": ConfigField(
-                type=float,
-                default=360.0,
-                description="人物画像快照 TTL（分钟）"
-            ),
-            "refresh_interval_minutes": ConfigField(
-                type=int,
-                default=30,
-                description="定时刷新周期（分钟）"
-            ),
-            "active_window_hours": ConfigField(
-                type=float,
-                default=72.0,
-                description="活跃人物窗口（小时），仅刷新窗口内人物"
-            ),
-            "max_refresh_per_cycle": ConfigField(
-                type=int,
-                default=50,
-                description="每轮最多刷新的人物数"
-            ),
-            "top_k_evidence": ConfigField(
-                type=int,
-                default=12,
-                description="人物画像构建时的向量证据数量上限"
-            ),
-        },
-        "memory": {
-             "half_life_hours": ConfigField(type=float, default=24.0, description="记忆强度半衰期 (小时)"),
-             "base_decay_interval_hours": ConfigField(type=float, default=1.0, description="衰减任务执行间隔 (小时)"),
-             "prune_threshold": ConfigField(type=float, default=0.1, description="记忆遗忘(冷冻)阈值"),
-             "freeze_duration_hours": ConfigField(type=float, default=0.01, description="记忆冷冻保留期 (小时), 过期物理删除"), # 默认可以设小点便于测试，或者保留24h
-             "enable_auto_reinforce": ConfigField(type=bool, default=True, description="是否启用自动强化"),
-             "reinforce_buffer_max_size": ConfigField(type=int, default=1000, description="强化缓冲区最大大小"),
-             "reinforce_cooldown_hours": ConfigField(type=float, default=1.0, description="同一记忆强化的冷却时间"),
-             "max_weight": ConfigField(type=float, default=10.0, description="记忆最大权重限制"),
-             "revive_boost_weight": ConfigField(type=float, default=0.5, description="复活时的基础增强权重"),
-             "auto_protect_ttl_hours": ConfigField(type=float, default=24.0, description="复活/强化后的自动保护时长"),
-             "min_active_weight_protected": ConfigField(type=float, default=0.5, description="保护期内记忆的最低权重地板"),
-             "enabled": ConfigField(type=bool, default=True, description="V5记忆系统总开关"),
-             "orphan": {
-                 "enable_soft_delete": ConfigField(type=bool, default=True, description="是否启用软删除"),
-                 "entity_retention_days": ConfigField(type=float, default=7.0, description="实体保留期(天)"),
-                 "paragraph_retention_days": ConfigField(type=float, default=7.0, description="段落保留期(天)"),
-                 "sweep_grace_hours": ConfigField(type=float, default=24.0, description="软删除宽限期(小时)"),
-             }
-        }
-    }
+    config_schema: dict = PLUGIN_CONFIG_SCHEMA
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        _set_global_instance(self)
         _patch_webui_a_memorix_routes_for_tomlkit_serialization()
         self._initialized = False
+        self._runtime_ready = False
+        self._init_lock = asyncio.Lock()
 
         # 核心存储组件
         self.vector_store: Optional[VectorStore] = None
@@ -794,11 +353,13 @@ class A_MemorixPlugin(BasePlugin):
         self._person_profile_refresh_task: Optional[asyncio.Task] = None
         self._memory_maintenance_task: Optional[asyncio.Task] = None
         self._relation_vector_backfill_task: Optional[asyncio.Task] = None
+        self._episode_generation_task: Optional[asyncio.Task] = None
 
         # 检索请求去重（短 TTL + in-flight 合并）
         self._request_dedup_cache: Dict[str, Dict[str, Any]] = {}
         self._request_dedup_inflight: Dict[str, asyncio.Future] = {}
         self._request_dedup_lock = asyncio.Lock()
+        self._request_router = RequestRouter(self)
 
     @property
     def debug_enabled(self) -> bool:
@@ -1012,9 +573,9 @@ class A_MemorixPlugin(BasePlugin):
                         (
                             "query_type",
                             "string",
-                            "查询类型：search(检索)、time(时序检索)、entity(实体)、relation(关系)、person(人物画像)、stats(统计)",
+                            "查询类型：search(检索)、time(时序检索)、episode(情景记忆)、aggregate(聚合)、entity(实体)、relation(关系)、person(人物画像)、stats(统计)",
                             True,
-                            ["search", "time", "entity", "relation", "person", "stats"],
+                            ["search", "time", "episode", "aggregate", "entity", "relation", "person", "stats"],
                         ),
                         (
                             "query",
@@ -1033,7 +594,7 @@ class A_MemorixPlugin(BasePlugin):
                         (
                             "top_k",
                             "integer",
-                            "返回结果数量（search/time模式）",
+                            "返回结果数量（search/time/episode模式）",
                             False,
                             None,
                         ),
@@ -1041,6 +602,20 @@ class A_MemorixPlugin(BasePlugin):
                             "use_threshold",
                             "boolean",
                             "是否使用动态阈值过滤（search/time模式）",
+                            False,
+                            None,
+                        ),
+                        (
+                            "mix",
+                            "boolean",
+                            "aggregate 模式是否输出混合融合结果（Weighted RRF）",
+                            False,
+                            None,
+                        ),
+                        (
+                            "mix_top_k",
+                            "integer",
+                            "aggregate 模式混合结果返回数量（默认回落 top_k）",
                             False,
                             None,
                         ),
@@ -1068,7 +643,14 @@ class A_MemorixPlugin(BasePlugin):
                         (
                             "source",
                             "string",
-                            "来源过滤（time模式可选）",
+                            "来源过滤（time/episode模式可选）",
+                            False,
+                            None,
+                        ),
+                        (
+                            "include_paragraphs",
+                            "boolean",
+                            "episode 模式是否附带关联段落明细",
                             False,
                             None,
                         ),
@@ -1157,53 +739,49 @@ class A_MemorixPlugin(BasePlugin):
 
 
     def register_plugin(self) -> bool:
-        """注册插件并同步初始化存储"""
-        self._sync_initialize()
+        """注册插件（初始化在 on_enable 异步执行）"""
         return super().register_plugin()
 
-    def _sync_initialize(self):
-        """同步初始化存储组件"""
-        if not self._initialized:
-            try:
-                logger.info("A_Memorix 插件正在开始同步初始化存储组件...")
-                self._initialize_storage()
-                self._initialized = True
-                
-                # --- V5 迁移：如果缺失则重建边映射 ---
-                if self.graph_store and self.metadata_store:
-                    # 检查映射是否为空但元数据存在（迁移场景）
-                    if not self.graph_store._edge_hash_map:
-                         # 确保元数据存储已连接/就绪（在 _initialize_storage 后应当如此）
-                         if self.metadata_store.has_data():
-                             logger.info("[V5 Migration] Detecting missing Edge Map. Attempting rebuild from Metadata...")
-                             try:
-                                 triples = self.metadata_store.get_all_triples()
-                                 if triples:
-                                     cnt = self.graph_store.rebuild_edge_hash_map(triples)
-                                     logger.info(f"[V5 Migration] Rebuilt {cnt} edge mappings.")
-                                     # Save immediately to persist the migration
-                                     self.graph_store.save() 
-                                 else:
-                                     logger.info("[V5 Migration] No triples found in MetadataStore.")
-                             except Exception as e:
-                                 logger.error(f"[V5 Migration] Failed to rebuild edge map: {e}")
-                
-                logger.info("A_Memorix 插件同步初始化成功")
+    def _validate_runtime_config(self) -> None:
+        mode = self._get_routing_mode_value("tool_search_mode", "forward")
+        if mode not in {"forward", "disabled"}:
+            raise ValueError(
+                "routing.tool_search_mode 仅允许 forward|disabled。"
+                " 请执行 scripts/release_vnext_migrate.py migrate 进行配置迁移。"
+            )
 
-                # 更新插件配置
-                self._update_plugin_config()
+        summary_model_cfg = self.get_config("summarization.model_name", ["auto"])
+        if not isinstance(summary_model_cfg, list):
+            raise ValueError(
+                "summarization.model_name 在新版本必须为数组(List[str])。"
+                " 请执行 scripts/release_vnext_migrate.py migrate。"
+            )
 
-            except Exception as e:
-                logger.error(f"A_Memorix 插件同步初始化失败: {e}")
-                import traceback
-                traceback.print_exc()
-        else:
-            logger.debug("A_Memorix 存储组件已初始化，跳过")
+        q_type = str(self.get_config("embedding.quantization_type", "int8") or "int8").strip().lower()
+        if q_type != "int8":
+            raise ValueError(
+                "embedding.quantization_type 在新版本仅支持 int8(SQ8)。"
+                " 请执行 scripts/release_vnext_migrate.py migrate。"
+            )
+
+    def _check_storage_ready(self) -> bool:
+        return all(
+            getattr(self, attr, None) is not None
+            for attr in ("metadata_store", "vector_store", "graph_store", "embedding_manager")
+        )
+
+    def is_runtime_ready(self) -> bool:
+        return bool(self._runtime_ready and self._check_storage_ready())
+
+    async def _ensure_initialized(self) -> None:
+        await ensure_initialized_runtime(self)
 
     async def on_enable(self):
         """插件启用时调用"""
         logger.info("A_Memorix 插件已启用")
-        self._sync_initialize()
+        await self._ensure_initialized()
+        if not self.is_runtime_ready():
+            raise RuntimeError("A_Memorix 未完成就绪，拒绝启动 Web/后台任务")
 
         # 启动独立 Web 服务器
         if self.get_config("web.enabled", True):
@@ -1224,6 +802,7 @@ class A_MemorixPlugin(BasePlugin):
     async def on_disable(self):
         """插件禁用时调用"""
         logger.info("A_Memorix 插件正在禁用...")
+        self._runtime_ready = False
 
         await self._cancel_background_tasks()
 
@@ -1257,68 +836,11 @@ class A_MemorixPlugin(BasePlugin):
 
     def _start_background_tasks(self):
         """启动后台任务（幂等，避免重复创建）。"""
-        if (
-            self.get_config("summarization.enabled", True)
-            and self.get_config("schedule.enabled", True)
-            and (self._scheduled_import_task is None or self._scheduled_import_task.done())
-        ):
-            self._scheduled_import_task = asyncio.create_task(self._scheduled_import_loop())
-
-        if (
-            self.get_config("advanced.enable_auto_save", True)
-            and (self._auto_save_task is None or self._auto_save_task.done())
-        ):
-            self._auto_save_task = asyncio.create_task(self._auto_save_loop())
-
-        if (
-            self.get_config("person_profile.enabled", True)
-            and (self._person_profile_refresh_task is None or self._person_profile_refresh_task.done())
-        ):
-            self._person_profile_refresh_task = asyncio.create_task(self._person_profile_refresh_loop())
-
-        if self._memory_maintenance_task is None or self._memory_maintenance_task.done():
-            self._memory_maintenance_task = asyncio.create_task(self._memory_maintenance_loop())
-
-        rv_cfg = self.get_config("retrieval.relation_vectorization", {}) or {}
-        if isinstance(rv_cfg, dict):
-            rv_enabled = bool(rv_cfg.get("enabled", False))
-            rv_backfill = bool(rv_cfg.get("backfill_enabled", False))
-        else:
-            rv_enabled = False
-            rv_backfill = False
-        if rv_enabled and rv_backfill and (
-            self._relation_vector_backfill_task is None or self._relation_vector_backfill_task.done()
-        ):
-            self._relation_vector_backfill_task = asyncio.create_task(self._relation_vector_backfill_loop())
+        start_background_tasks_runtime(self)
 
     async def _cancel_background_tasks(self):
         """停止后台任务并等待收敛。"""
-        tasks = [
-            ("scheduled_import", self._scheduled_import_task),
-            ("auto_save", self._auto_save_task),
-            ("person_profile_refresh", self._person_profile_refresh_task),
-            ("memory_maintenance", self._memory_maintenance_task),
-            ("relation_vector_backfill", self._relation_vector_backfill_task),
-        ]
-        for _, task in tasks:
-            if task and not task.done():
-                task.cancel()
-
-        for name, task in tasks:
-            if not task:
-                continue
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-            except Exception as e:
-                logger.warning(f"后台任务 {name} 退出异常: {e}")
-
-        self._scheduled_import_task = None
-        self._auto_save_task = None
-        self._person_profile_refresh_task = None
-        self._memory_maintenance_task = None
-        self._relation_vector_backfill_task = None
+        await cancel_background_tasks_runtime(self)
 
     async def on_unload(self):
         """插件卸载时调用"""
@@ -1345,278 +867,36 @@ class A_MemorixPlugin(BasePlugin):
 
     @staticmethod
     def get_global_instance() -> Optional['A_MemorixPlugin']:
-        """获取全局插件实例（供组件使用）"""
-        return _get_global_instance()
+        """获取插件实例（通过 PluginManager 解析，不使用全局单例）。"""
+        return _resolve_loaded_plugin_instance("A_Memorix")
 
     @classmethod
     def get_storage_instances(cls) -> Dict[str, Any]:
-        """获取存储实例（供组件兜底使用）"""
-        logger.info("get_storage_instances() 被调用")
-        
-        instance = _get_global_instance()
-        logger.info(f"  _get_global_instance() 返回: {instance is not None}")
-        
-        if instance:
-            result = {
-                "vector_store": instance.vector_store,
-                "graph_store": instance.graph_store,
-                "metadata_store": instance.metadata_store,
-                "embedding_manager": instance.embedding_manager,
-                "sparse_index": instance.sparse_index,
-                "relation_write_service": instance.relation_write_service,
-            }
-            logger.info(f"  从全局实例获取: vector_store={result['vector_store'] is not None}, "
-                       f"graph_store={result['graph_store'] is not None}, "
-                       f"metadata_store={result['metadata_store'] is not None}, "
-                       f"embedding_manager={result['embedding_manager'] is not None}, "
-                       f"sparse_index={result['sparse_index'] is not None}")
-            return result
-        
-        # 如果单例不存在，尝试从 PluginManager 获取
-        logger.warning("  全局实例不存在，尝试从 PluginManager 获取...")
-        try:
-            from src.plugin_system.core.plugin_manager import plugin_manager
-            plugin = plugin_manager.get_plugin_instance("A_Memorix")
-            logger.info(f"  plugin_manager.get_plugin_instance('A_Memorix') 返回: {plugin is not None}")
-            
-            if plugin and hasattr(plugin, "vector_store"):
-                result = {
-                    "vector_store": getattr(plugin, "vector_store"),
-                    "graph_store": getattr(plugin, "graph_store"),
-                    "metadata_store": getattr(plugin, "metadata_store"),
-                    "embedding_manager": getattr(plugin, "embedding_manager"),
-                    "sparse_index": getattr(plugin, "sparse_index", None),
-                    "relation_write_service": getattr(plugin, "relation_write_service", None),
-                }
-                logger.info(f"  从 PluginManager 获取: vector_store={result['vector_store'] is not None}, "
-                           f"graph_store={result['graph_store'] is not None}, "
-                           f"metadata_store={result['metadata_store'] is not None}, "
-                           f"embedding_manager={result['embedding_manager'] is not None}, "
-                           f"sparse_index={result['sparse_index'] is not None}")
-                return result
-        except Exception as e:
-            logger.error(f"通过 PluginManager 获取存储实例失败: {e}")
-            import traceback
-            traceback.print_exc()
-            
-        logger.error("  所有获取方式都失败，返回空字典")
-        return {}
+        """获取存储实例（组件兜底路径）。"""
+        instance = cls.get_global_instance()
+        if instance is None:
+            return {}
+        return {
+            "vector_store": instance.vector_store,
+            "graph_store": instance.graph_store,
+            "metadata_store": instance.metadata_store,
+            "embedding_manager": instance.embedding_manager,
+            "sparse_index": instance.sparse_index,
+            "relation_write_service": instance.relation_write_service,
+            "plugin_instance": instance,
+        }
 
     async def _initialize_storage_async(self):
         """异步初始化存储组件（用于嵌入维度检测）"""
-        # 从config.toml获取配置
-        data_dir_str = self.get_config("storage.data_dir", "./data")
-        
-        # 处理相对路径：如果是相对路径，则相对于插件目录
-        if data_dir_str.startswith("."):
-            # 获取当前文件(plugin.py)所在目录
-            plugin_dir = Path(__file__).resolve().parent
-            data_dir = (plugin_dir / data_dir_str).resolve()
-        else:
-            data_dir = Path(data_dir_str)
-            
-        logger.info(f"A_Memorix 数据存储路径: {data_dir}")
-
-        # 创建数据目录
-        data_dir.mkdir(parents=True, exist_ok=True)
-
-        # 初始化嵌入 API 适配器
-        self.embedding_manager = create_embedding_api_adapter(
-            batch_size=self.get_config("embedding.batch_size", 32),
-            max_concurrent=self.get_config("embedding.max_concurrent", 5),
-            default_dimension=self.get_config("embedding.dimension", 1024),
-            model_name=self.get_config("embedding.model_name", "auto"),
-            retry_config=self.get_config("embedding.retry", {}),
-        )
-        logger.info("嵌入 API 适配器初始化完成")
-
-        # 异步检测嵌入维度
-        try:
-            detected_dimension = await self.embedding_manager._detect_dimension()
-            logger.info(f"嵌入维度检测成功: {detected_dimension}")
-        except Exception as e:
-            logger.warning(f"嵌入维度检测失败: {e}，使用默认值")
-            detected_dimension = self.embedding_manager.default_dimension
-
-        # 获取量化类型
-        quantization_str = self.get_config("embedding.quantization_type", "int8")
-        from .core.storage import QuantizationType
-        quantization_map = {
-            "float32": QuantizationType.FLOAT32,
-            "int8": QuantizationType.INT8,
-            "pq": QuantizationType.PQ,
-        }
-        quantization_type = quantization_map.get(quantization_str, QuantizationType.INT8)
-
-        # 初始化向量存储（使用检测到的维度）
-        self.vector_store = VectorStore(
-            dimension=detected_dimension,
-            quantization_type=quantization_type,
-            data_dir=data_dir / "vectors",
-        )
-        self.vector_store.min_train_threshold = self.get_config("embedding.min_train_threshold", 40)
-        logger.info(f"向量存储初始化完成（维度: {detected_dimension}, 训练阈值: {self.vector_store.min_train_threshold}）")
-
-        # 获取稀疏矩阵格式
-        matrix_format_str = self.get_config("graph.sparse_matrix_format", "csr")
-        from .core.storage import SparseMatrixFormat
-        matrix_format_map = {
-            "csr": SparseMatrixFormat.CSR,
-            "csc": SparseMatrixFormat.CSC,
-        }
-        matrix_format = matrix_format_map.get(matrix_format_str, SparseMatrixFormat.CSR)
-
-        # 初始化图存储
-        self.graph_store = GraphStore(
-            matrix_format=matrix_format,
-            data_dir=data_dir / "graph",
-        )
-        logger.info("图存储初始化完成")
-
-        # 初始化元数据存储
-        self.metadata_store = MetadataStore(data_dir=data_dir / "metadata")
-        self.metadata_store.connect()
-        logger.info("元数据存储初始化完成")
-
-        # 初始化统一关系写入服务
-        self.relation_write_service = RelationWriteService(
-            metadata_store=self.metadata_store,
-            graph_store=self.graph_store,
-            vector_store=self.vector_store,
-            embedding_manager=self.embedding_manager,
-        )
-        logger.info("关系写入服务初始化完成")
-
-        # 初始化稀疏检索组件（懒加载，不立即装载索引）
-        sparse_cfg_raw = self.get_config("retrieval.sparse", {}) or {}
-        if not isinstance(sparse_cfg_raw, dict):
-            sparse_cfg_raw = {}
-        try:
-            sparse_cfg = SparseBM25Config(**sparse_cfg_raw)
-        except Exception as e:
-            logger.warning(f"sparse 配置非法，回退默认配置: {e}")
-            sparse_cfg = SparseBM25Config()
-        self.sparse_index = SparseBM25Index(
-            metadata_store=self.metadata_store,
-            config=sparse_cfg,
-        )
-        logger.info(
-            "稀疏检索组件初始化完成: enabled=%s, lazy_load=%s, mode=%s, tokenizer=%s",
-            sparse_cfg.enabled,
-            sparse_cfg.lazy_load,
-            sparse_cfg.mode,
-            sparse_cfg.tokenizer_mode,
-        )
-        if sparse_cfg.enabled and not sparse_cfg.lazy_load:
-            self.sparse_index.ensure_loaded()
-
-        # 加载现有数据（如果存在）
-        if self.vector_store.has_data():
-            try:
-                self.vector_store.load()
-                logger.info(f"向量数据已加载，共 {self.vector_store.num_vectors} 个向量")
-            except Exception as e:
-                logger.warning(f"加载向量数据失败: {e}")
-
-        # 预热向量索引：将训练/回放前置到启动阶段，避免首个线上请求触发重初始化。
-        try:
-            warmup_summary = self.vector_store.warmup_index(force_train=True)
-            if warmup_summary.get("ok"):
-                logger.info(
-                    "向量索引预热完成: "
-                    f"trained={warmup_summary.get('trained')}, "
-                    f"index_ntotal={warmup_summary.get('index_ntotal')}, "
-                    f"fallback_ntotal={warmup_summary.get('fallback_ntotal')}, "
-                    f"bin_count={warmup_summary.get('bin_count')}, "
-                    f"duration_ms={float(warmup_summary.get('duration_ms', 0.0)):.2f}"
-                )
-            else:
-                logger.warning(
-                    "向量索引预热失败，继续启用 sparse 降级路径: "
-                    f"{warmup_summary.get('error', 'unknown')}"
-                )
-        except Exception as e:
-            logger.warning(f"向量索引预热异常，继续启用 sparse 降级路径: {e}")
-
-        if self.graph_store.has_data():
-            try:
-                self.graph_store.load()
-                logger.info(f"图数据已加载，共 {self.graph_store.num_nodes} 个节点")
-            except Exception as e:
-                logger.warning(f"加载图数据失败: {e}")
-        
-        logger.info(f"知识库数据目录: {data_dir}")
+        await initialize_storage_async_runtime(self)
 
     def _initialize_storage(self):
-        """同步初始化存储组件（包装异步方法）"""
-        import asyncio
-        
-        # 获取或创建事件循环
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # 如果循环正在运行，创建新任务
-                logger.warning("事件循环正在运行，使用 asyncio.create_task")
-                # 这种情况下我们不能直接 await，需要特殊处理
-                # 暂时使用同步方式，后续可以优化
-                import nest_asyncio
-                nest_asyncio.apply()
-                loop.run_until_complete(self._initialize_storage_async())
-            else:
-                # 循环未运行，直接运行
-                loop.run_until_complete(self._initialize_storage_async())
-        except RuntimeError:
-            # 没有事件循环，创建新的
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                loop.run_until_complete(self._initialize_storage_async())
-            finally:
-                loop.close()
+        """已弃用：初始化必须走异步生命周期。"""
+        raise RuntimeError("同步初始化路径已移除，请使用 await _ensure_initialized()")
 
     async def _scheduled_import_loop(self):
         """定时总结导入循环"""
-        import asyncio
-        import datetime
-        
-        logger.info("A_Memorix 定时总结导入任务已启动")
-        
-        # 记录上次检查的时间，用于跨越时间点检测
-        last_check_now = datetime.datetime.now()
-        
-        while True:
-            try:
-                # 每分钟检查一次
-                await asyncio.sleep(60)
-                
-                # 检查总开关和定时开关
-                if not self.get_config("summarization.enabled", True) or not self.get_config("schedule.enabled", True):
-                    continue
-                
-                now = datetime.datetime.now()
-                import_times = self.get_config("schedule.import_times", ["04:00"])
-                
-                for t_str in import_times:
-                    try:
-                        # 解析配置的时间点 (HH:MM)
-                        h, m = map(int, t_str.split(":"))
-                        # 构造今天的该时间点
-                        target_time = now.replace(hour=h, minute=m, second=0, microsecond=0)
-                        
-                        # 如果当前时间刚跨过目标时间点
-                        if last_check_now < target_time <= now:
-                            logger.info(f"触发 A_Memorix 定时导入任务: {t_str}")
-                            await self._perform_bulk_summary_import()
-                    except (ValueError, Exception) as e:
-                        logger.error(f"解析定时配置 '{t_str}' 出错: {e}")
-                
-                last_check_now = now
-                
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"定时导入循环发生未知错误: {e}")
-                await asyncio.sleep(60)
+        await scheduled_import_loop_runtime(self)
 
     def is_chat_enabled(self, stream_id: str, group_id: str = None, user_id: str = None) -> bool:
         """检查聊天流是否启用记忆功能
@@ -1675,105 +955,41 @@ class A_MemorixPlugin(BasePlugin):
             # 黑名单模式：匹配到的被禁用
             return not is_matched
 
+    def _get_request_router(self) -> RequestRouter:
+        router = getattr(self, "_request_router", None)
+        if router is None:
+            router = RequestRouter(self)
+            self._request_router = router
+        return router
+
     def _get_routing_mode_value(self, key: str, default: str) -> str:
-        value = str(self.get_config(f"routing.{key}", default) or default).strip().lower()
-        return value or default
+        return self._get_request_router().get_routing_mode_value(key, default)
 
     def get_search_owner(self) -> str:
-        owner = self._get_routing_mode_value("search_owner", "action")
-        if owner not in {"action", "tool", "dual"}:
-            return "action"
-        return owner
+        return self._get_request_router().get_search_owner()
 
     def get_tool_search_mode(self) -> str:
-        mode = self._get_routing_mode_value("tool_search_mode", "forward")
-        if mode == "legacy":
-            logger.warning("routing.tool_search_mode=legacy 已废弃，按 forward 处理")
-            return "forward"
-        if mode not in {"forward", "disabled"}:
-            return "forward"
-        return mode
+        return self._get_request_router().get_tool_search_mode()
 
     def _is_request_dedup_enabled(self) -> bool:
-        return bool(self.get_config("routing.enable_request_dedup", True))
+        return self._get_request_router().is_request_dedup_enabled()
 
     def _get_request_dedup_ttl_seconds(self) -> float:
-        try:
-            ttl = float(self.get_config("routing.request_dedup_ttl_seconds", 2))
-        except (TypeError, ValueError):
-            ttl = 2.0
-        return max(0.1, ttl)
+        return self._get_request_router().get_request_dedup_ttl_seconds()
 
     def _cleanup_request_dedup_cache_locked(self, now_ts: Optional[float] = None) -> None:
-        now_ts = now_ts if now_ts is not None else time.time()
-        stale_keys = [
-            key
-            for key, entry in self._request_dedup_cache.items()
-            if float(entry.get("expires_at", 0.0)) <= now_ts
-        ]
-        for key in stale_keys:
-            self._request_dedup_cache.pop(key, None)
+        self._get_request_router().cleanup_request_dedup_cache_locked(now_ts)
 
     async def execute_request_with_dedup(
         self,
         request_key: str,
         executor: Callable[[], Awaitable[Any]],
     ) -> Tuple[bool, Any]:
-        """
-        执行短时请求去重。
-
-        Returns:
-            Tuple[bool, Any]: (是否命中去重缓存/并发复用, 执行结果)
-        """
-        if not self._is_request_dedup_enabled():
-            result = await executor()
-            return False, result
-
-        wait_future: Optional[asyncio.Future] = None
-        is_owner = False
-        now_ts = time.time()
-
-        async with self._request_dedup_lock:
-            self._cleanup_request_dedup_cache_locked(now_ts)
-
-            cached = self._request_dedup_cache.get(request_key)
-            if cached and float(cached.get("expires_at", 0.0)) > now_ts:
-                return True, cached.get("result")
-
-            inflight = self._request_dedup_inflight.get(request_key)
-            if inflight is not None:
-                wait_future = inflight
-            else:
-                loop = asyncio.get_running_loop()
-                new_future: asyncio.Future = loop.create_future()
-                self._request_dedup_inflight[request_key] = new_future
-                wait_future = new_future
-                is_owner = True
-
-        if not is_owner and wait_future is not None:
-            result = await wait_future
-            return True, result
-
-        assert wait_future is not None
-        try:
-            result = await executor()
-            ttl = self._get_request_dedup_ttl_seconds()
-            expires_at = time.time() + ttl
-            async with self._request_dedup_lock:
-                self._request_dedup_cache[request_key] = {
-                    "result": result,
-                    "expires_at": expires_at,
-                }
-                future = self._request_dedup_inflight.pop(request_key, None)
-                if future is not None and not future.done():
-                    future.set_result(result)
-            return False, result
-        except Exception as e:
-            async with self._request_dedup_lock:
-                future = self._request_dedup_inflight.pop(request_key, None)
-                if future is not None and not future.done():
-                    future.set_exception(e)
-            raise
+        """执行短时请求去重。"""
+        return await self._get_request_router().execute_request_with_dedup(
+            request_key=request_key,
+            executor=executor,
+        )
 
     def is_person_profile_injection_enabled(self, stream_id: str, user_id: str) -> bool:
         """检查人物画像自动注入是否开启（按 stream_id + user_id）。"""
@@ -1797,138 +1013,15 @@ class A_MemorixPlugin(BasePlugin):
 
     async def _person_profile_refresh_loop(self):
         """按需刷新人物画像快照（仅针对已开启范围内活跃人物）。"""
-        logger.info("A_Memorix 人物画像定时刷新任务已启动")
-        try:
-            while True:
-                interval_minutes = int(self.get_config("person_profile.refresh_interval_minutes", 30))
-                await asyncio.sleep(max(60, interval_minutes * 60))
-
-                if not bool(self.get_config("person_profile.enabled", True)):
-                    continue
-
-                await self._refresh_person_profiles_for_enabled_switches()
-        except asyncio.CancelledError:
-            logger.info("人物画像定时刷新任务已取消")
-        except Exception as e:
-            logger.error(f"人物画像定时刷新循环异常: {e}")
+        await person_profile_refresh_loop_runtime(self)
 
     async def _refresh_person_profiles_for_enabled_switches(self):
         """刷新已开启范围内活跃人物画像。"""
-        if self.metadata_store is None:
-            return
-
-        active_window_hours = float(self.get_config("person_profile.active_window_hours", 72.0))
-        active_after = time.time() - max(0.0, active_window_hours) * 3600.0
-        max_refresh = int(self.get_config("person_profile.max_refresh_per_cycle", 50))
-        top_k_evidence = int(self.get_config("person_profile.top_k_evidence", 12))
-        ttl_minutes = float(self.get_config("person_profile.profile_ttl_minutes", 360.0))
-        ttl_seconds = max(60.0, ttl_minutes * 60.0)
-
-        try:
-            person_ids = self.metadata_store.get_active_person_ids_for_enabled_switches(
-                active_after=active_after,
-                limit=max_refresh,
-            )
-        except Exception as e:
-            logger.warning(f"获取待刷新人物集合失败: {e}")
-            return
-
-        if not person_ids:
-            logger.debug("人物画像刷新跳过：暂无已开启范围内活跃人物")
-            return
-
-        from .core.utils.person_profile_service import PersonProfileService
-
-        service = PersonProfileService(
-            metadata_store=self.metadata_store,
-            graph_store=self.graph_store,
-            vector_store=self.vector_store,
-            embedding_manager=self.embedding_manager,
-            sparse_index=self.sparse_index,
-            plugin_config=self.config,
-        )
-
-        refreshed = 0
-        for person_id in person_ids:
-            try:
-                result = await service.query_person_profile(
-                    person_id=person_id,
-                    top_k=top_k_evidence,
-                    ttl_seconds=ttl_seconds,
-                    force_refresh=True,
-                    source_note="schedule_refresh",
-                )
-                if result.get("success"):
-                    refreshed += 1
-            except Exception as e:
-                logger.warning(f"刷新人物画像失败: person_id={person_id}, err={e}")
-
-        logger.info(f"人物画像按需刷新完成: refreshed={refreshed}, candidates={len(person_ids)}")
+        await refresh_profiles_runtime(self)
 
     async def _perform_bulk_summary_import(self):
         """为所有活跃聊天执行总结导入"""
-        import asyncio
-        from .core.utils.summary_importer import SummaryImporter
-        from src.common.database.database_model import ChatStreams
-        
-        # 实例化导入器
-        importer = SummaryImporter(
-            vector_store=self.vector_store,
-            graph_store=self.graph_store,
-            metadata_store=self.metadata_store,
-            embedding_manager=self.embedding_manager,
-            plugin_config=self.config
-        )
-        
-        # 获取所有已知的聊天流 ID, Group ID 和 User ID
-        def _get_all_streams():
-            try:
-                # 获取 stream_id, group_id, user_id
-                query = ChatStreams.select(ChatStreams.stream_id, ChatStreams.group_id, ChatStreams.user_id)
-                return [{
-                    "stream_id": s.stream_id, 
-                    "group_id": s.group_id,
-                    "user_id": s.user_id
-                } for s in query]
-            except Exception as e:
-                logger.error(f"获取聊天流列表失败: {e}")
-                return []
-            
-        streams = await asyncio.to_thread(_get_all_streams)
-        
-        if not streams:
-            logger.info("未发现可总结的聊天流")
-            return
-            
-        logger.info(f"开始为 {len(streams)} 个聊天流执行批量总结检查...")
-        
-        success_count = 0
-        skipped_count = 0
-        
-        for s in streams:
-            s_id = s["stream_id"]
-            g_id = s.get("group_id")
-            u_id = s.get("user_id")
-            
-            # 过滤检查
-            if not self.is_chat_enabled(stream_id=s_id, group_id=g_id, user_id=u_id):
-                skipped_count += 1
-                continue
-                
-            try:
-                # 执行总结导入 (SummaryImporter 内部会处理无新消息的情况)
-                success, msg = await importer.import_from_stream(s_id)
-                if success:
-                    success_count += 1
-                    logger.info(f"聊天流 {s_id} 自动总结成功")
-            except Exception as e:
-                logger.error(f"处理聊天流 {s_id} 自动总结时出错: {e}")
-                
-        logger.info(f"批量总结任务完成，成功: {success_count}，跳过: {skipped_count}")
-
-
-
-        logger.info(f"批量总结任务完成，成功: {success_count}，跳过: {skipped_count}")
+        await perform_bulk_summary_import_runtime(self)
 
     def is_relation_vectorization_enabled(self) -> bool:
         cfg = self.get_config("retrieval.relation_vectorization", {}) or {}
@@ -1944,541 +1037,56 @@ class A_MemorixPlugin(BasePlugin):
 
     async def _relation_vector_backfill_loop(self):
         """后台分批回填关系向量。"""
-        logger.info("A_Memorix 关系向量回填任务已启动")
-        try:
-            while True:
-                cfg = self.get_config("retrieval.relation_vectorization", {}) or {}
-                if not isinstance(cfg, dict):
-                    cfg = {}
-                interval_seconds = max(1, int(cfg.get("backfill_interval_seconds", 5)))
-                await asyncio.sleep(interval_seconds)
+        await relation_vector_backfill_loop_runtime(self)
 
-                if not bool(cfg.get("enabled", False)) or not bool(cfg.get("backfill_enabled", False)):
-                    continue
-                if not self.relation_write_service or not self.metadata_store:
-                    continue
-                self._cleanup_orphan_relation_vectors(limit=200)
-
-                batch_size = max(1, int(cfg.get("backfill_batch_size", 200)))
-                max_retry = max(1, int(cfg.get("max_retry", 3)))
-
-                start = time.perf_counter()
-                rows = self.metadata_store.list_relations_by_vector_state(
-                    states=["none", "failed", "pending"],
-                    limit=batch_size,
-                    max_retry=max_retry,
-                )
-                if not rows:
-                    continue
-
-                success = 0
-                failed = 0
-                skipped = 0
-                for row in rows:
-                    res = await self.relation_write_service.ensure_relation_vector(
-                        hash_value=str(row["hash"]),
-                        subject=str(row.get("subject", "")),
-                        predicate=str(row.get("predicate", "")),
-                        obj=str(row.get("object", "")),
-                    )
-                    if res.vector_state == "ready":
-                        if res.vector_written:
-                            success += 1
-                        else:
-                            skipped += 1
-                    else:
-                        failed += 1
-
-                elapsed_ms = (time.perf_counter() - start) * 1000.0
-                state_stats = self.metadata_store.count_relations_by_vector_state()
-                remaining = (
-                    int(state_stats.get("none", 0))
-                    + int(state_stats.get("failed", 0))
-                    + int(state_stats.get("pending", 0))
-                )
-                logger.info(
-                    "metric.relation_backfill_batch_latency=%.2f metric.relation_backfill_batch_latency_ms=%.2f processed=%s success=%s failed=%s skipped=%s remaining=%s",
-                    elapsed_ms,
-                    elapsed_ms,
-                    len(rows),
-                    success,
-                    failed,
-                    skipped,
-                    remaining,
-                )
-        except asyncio.CancelledError:
-            logger.info("关系向量回填任务已取消")
-        except Exception as e:
-            logger.error(f"关系向量回填循环发生错误: {e}")
+    async def _episode_generation_loop(self):
+        """后台异步生成 Episode。"""
+        await episode_generation_loop_runtime(self)
 
     def _cleanup_orphan_relation_vectors(self, limit: int = 200) -> int:
         """清理关系孤儿向量（deleted_relations 存在且 relations 不存在）。"""
-        if not self.metadata_store or not self.vector_store:
-            return 0
-        try:
-            rows = self.metadata_store.query(
-                """
-                SELECT d.hash
-                FROM deleted_relations d
-                LEFT JOIN relations r ON r.hash = d.hash
-                WHERE r.hash IS NULL
-                LIMIT ?
-                """,
-                (max(1, int(limit)),),
-            )
-        except Exception as e:
-            logger.debug(f"孤儿向量清理跳过（查询失败）: {e}")
-            return 0
-        if not rows:
-            return 0
-
-        candidate_hashes = [str(row["hash"]) for row in rows if row.get("hash")]
-        orphan_hashes = [h for h in candidate_hashes if h in self.vector_store]
-        if not orphan_hashes:
-            return 0
-
-        deleted = self.vector_store.delete(orphan_hashes)
-        if deleted > 0:
-            logger.info(
-                "metric.orphan_vector_cleanup_count=%s scanned=%s",
-                deleted,
-                len(candidate_hashes),
-            )
-        return int(deleted)
+        return cleanup_orphan_relation_vectors_runtime(self, limit=limit)
 
     def get_relation_vector_stats(self) -> Dict[str, Any]:
         """返回关系向量状态与覆盖统计。"""
-        if not self.metadata_store:
-            return {}
-
-        state_stats = self.metadata_store.count_relations_by_vector_state()
-        relation_hashes = {str(row["hash"]) for row in self.metadata_store.query("SELECT hash FROM relations")}
-        paragraph_hashes = {
-            str(row["hash"]) for row in self.metadata_store.query("SELECT hash FROM paragraphs")
-        }
-        entity_hashes = {str(row["hash"]) for row in self.metadata_store.query("SELECT hash FROM entities")}
-
-        live_vector_hashes = set()
-        orphan_count = 0
-        relation_vector_hits = 0
-        ready_but_missing_vector = 0
-        if self.vector_store:
-            known_hashes = set(getattr(self.vector_store, "_known_hashes", set()))
-            live_vector_hashes = {h for h in known_hashes if h in self.vector_store}
-            relation_vector_hits = len(relation_hashes & live_vector_hashes)
-            orphan_count = len(live_vector_hashes - relation_hashes - paragraph_hashes - entity_hashes)
-
-            if relation_hashes:
-                ready_rows = self.metadata_store.query(
-                    "SELECT hash FROM relations WHERE COALESCE(vector_state, 'none') = 'ready'"
-                )
-                ready_but_missing_vector = sum(
-                    1 for row in ready_rows if str(row["hash"]) not in live_vector_hashes
-                )
-
-        relation_total = max(0, int(state_stats.get("total", len(relation_hashes))))
-        ready_total = max(0, int(state_stats.get("ready", 0)))
-        ready_coverage = (ready_total / relation_total) if relation_total > 0 else 0.0
-        vector_coverage = (
-            relation_vector_hits / len(relation_hashes)
-            if relation_hashes
-            else 0.0
-        )
-
-        return {
-            "states": state_stats,
-            "orphan_vectors": orphan_count,
-            "relation_total": len(relation_hashes),
-            "relation_vector_hits": relation_vector_hits,
-            "relation_ready_coverage": ready_coverage,
-            "relation_vector_coverage": vector_coverage,
-            "ready_but_missing_vector": ready_but_missing_vector,
-        }
+        return get_relation_vector_stats_runtime(self)
 
     async def save_all(self):
-        """统一保存所有数据 (Unified Persistence)"""
-        if not self.vector_store or not self.graph_store:
-            return
-
-        commit_id = str(uuid.uuid4())
-        logger.info(f"开始统一保存 (Commit ID: {commit_id})...")
-        
-        try:
-            # 并行保存各组件
-            # VectorStore 和 GraphStore 的 save 方法现在已经是线程安全的(或使用原子写)
-            # 但为了减少IO阻塞，最好在线程池运行
-            await asyncio.gather(
-                asyncio.to_thread(self.vector_store.save),
-                asyncio.to_thread(self.graph_store.save)
-                # MetadataStore 是 SQLite，通常实时写入，无需显式 save
-            )
-            
-            # 更新 Manifest，标志着一次完整的持久化状态
-            await self._update_manifest(commit_id)
-            logger.info(f"统一保存完成 (Commit ID: {commit_id})")
-            
-        except Exception as e:
-            logger.error(f"统一保存失败: {e}")
+        """统一保存所有数据(Unified Persistence)"""
+        await save_all_runtime(self)
 
     async def _update_manifest(self, commit_id: str):
         """更新持久化清单"""
-        manifest = {
-            "last_commit_id": commit_id,
-            "timestamp": time.time(),
-            "iso_timestamp": datetime.datetime.now().isoformat(),
-            "version": self.plugin_version
-        }
-        
-        data_dir = Path(self.get_config("storage.data_dir", "./plugins/A_memorix/data"))
-        manifest_path = data_dir / "persistence_manifest.json"
-        
-        try:
-            # 使用原子写入更新 Manifest
-            with atomic_write(manifest_path, "w", encoding="utf-8") as f:
-                json.dump(manifest, f, indent=2)
-        except Exception as e:
-            logger.error(f"更新 Manifest 失败: {e}")
+        await update_manifest_runtime(self, commit_id=commit_id)
 
     async def _auto_save_loop(self):
         """自动保存循环"""
-        logger.info("自动保存任务已启动")
-        try:
-            while True:
-                # 获取配置的间隔时间 (分钟)
-                interval = self.get_config("advanced.auto_save_interval_minutes", 5)
-                if interval <= 0:
-                    interval = 5
-                
-                await asyncio.sleep(interval * 60)
-                
-                if self.get_config("advanced.enable_auto_save", True):
-                    await self.save_all()
-                    
-        except asyncio.CancelledError:
-            logger.info("自动保存任务已取消")
-        except Exception as e:
-            logger.error(f"自动保存循环发生错误: {e}")
+        await auto_save_loop_runtime(self)
 
     # =========================================================================
     # V5 Memory System Logic
     # =========================================================================
 
     async def reinforce_access(self, relation_hashes: List[str]):
-        """
-        触发记忆强化 (Thread-safe push to buffer)
-        """
-        if not self.get_config("memory.enable_auto_reinforce", True):
-            return
+        """触发记忆强化 (Thread-safe push to buffer)"""
+        await reinforce_access_runtime(self, relation_hashes=relation_hashes)
             
-        async with self._memory_lock:
-            self.reinforce_buffer.update(relation_hashes)
-            
-            # 如果缓冲区过大，可以考虑触发立即处理（可选，目前依赖定时循环即可） (TODO)
 
     async def _memory_maintenance_loop(self):
-        """
-        记忆维护循环 (Decay, Reinforce, Freeze, Prune)
-        """
-        logger.info("A_Memorix 记忆维护循环已启动 (V5)")
-        
-        while True:
-            try:
-                # 获取间隔 (默认1小时)
-                interval_hours = self.get_config("memory.base_decay_interval_hours", 1.0)
-                interval_seconds = max(60, int(interval_hours * 3600))
-                
-                await asyncio.sleep(interval_seconds)
-                
-                if not self.metadata_store or not self.graph_store:
-                    continue
-                    
-                # Master Switch Check
-                if not self.get_config("memory.enabled", True):
-                    continue
-                    
-                async with self._memory_lock:
-                    # 1. Process Reinforce Buffer
-                    current_buffer = list(self.reinforce_buffer)
-                    self.reinforce_buffer.clear()
-                    
-                    if current_buffer:
-                        await self._process_reinforce_batch(current_buffer)
-                        
-                    # 2. 全局衰减 (Global Decay)
-                    half_life = self.get_config("memory.half_life_hours", 24.0)
-                    if half_life > 0:
-                        # factor = (1/2) ^ (dt / half_life)
-                        factor = 0.5 ** (interval_hours / half_life)
-                        # 保护地板值由 prune 逻辑处理，decay 只负责乘法
-                        self.graph_store.decay(factor)
-                        logger.debug(f"执行记忆衰减: factor={factor:.4f}")
-                        
-                    # 3. 冷冻与修剪 (Freeze & Prune) (检查候选记忆)
-                    await self._process_freeze_and_prune()
-                    
-                    # 4. 孤儿节点回收 (Orphan GC) (标记与清除)
-                    await self._orphan_gc_phase()
-
-            except asyncio.CancelledError:
-                logger.info("记忆维护循环已取消")
-                break
-            except Exception as e:
-                logger.error(f"记忆维护循环发生错误: {e}")
-                import traceback
-                traceback.print_exc()
-                await asyncio.sleep(60)
+        """记忆维护循环 (Decay, Reinforce, Freeze, Prune)"""
+        await memory_maintenance_loop_runtime(self)
 
     async def _process_reinforce_batch(self, hashes: List[str]):
         """处理强化批次"""
-        try:
-            # 获取当前状态
-            status_map = self.metadata_store.get_relation_status_batch(hashes)
-            
-            now = datetime.datetime.now().timestamp()
-            cooldown = self.get_config("memory.reinforce_cooldown_hours", 1.0) * 3600
-            max_weight = self.get_config("memory.max_weight", 10.0)
-            revive_boost = self.get_config("memory.revive_boost_weight", 0.5)
-            auto_protect = self.get_config("memory.auto_protect_ttl_hours", 24.0) * 3600
-            
-            hashes_to_update = []
-            hashes_to_revive = []
-            updates_protect = []
-            
-            # 需要查出 subject, object, predicate 来更新 GraphStore (因为 update_edge_weight 需要 u, v)
-            # 这里稍微有点低效，因为 status_map 没包含 s, o。
-            # 为了准确性，我们需要查询。
-            cursor = self.metadata_store._conn.cursor()
-            placeholders = ",".join(["?"] * len(hashes))
-            cursor.execute(f"SELECT hash, subject, object FROM relations WHERE hash IN ({placeholders})", hashes)
-            relation_info = {row[0]: (row[1], row[2]) for row in cursor.fetchall()}
-            
-            for h in hashes:
-                if h not in status_map: continue
-                s = status_map[h]
-                info = relation_info.get(h)
-                if not info: continue
-                
-                src, tgt = info
-                
-                # 冷却检查 (Cooldown Check)
-                last_re = s.get("last_reinforced") or 0
-                if (now - last_re) < cooldown and not s["is_inactive"]:
-                    continue # 如果仍在冷却中且处于活跃状态，则跳过
-                    
-                # 计算增量权重 (Calculate Delta)
-                current_w = s["weight"]
-                # Delta = amount * (1 - w/max)
-                delta = 1.0 * (1.0 - (current_w / max_weight))
-                if delta < 0: delta = 0
-                
-                # 逻辑:
-                # 1. 更新图权重 (Update Graph Weight)
-                self.graph_store.update_edge_weight(src, tgt, delta, max_weight=max_weight)
-                
-                # 2. 元数据更新 (Metadata Updates)
-                # 如果是不活跃状态，复活需要进行显式处理？
-                # 实际上 update_edge_weight 会添加缺失的边，但我们需要更新元数据标志。
-                if s["is_inactive"]:
-                    hashes_to_revive.append(h)
-                else:
-                    hashes_to_update.append(h)
-                    
-            # 批量更新元数据 (Batch update Metadata)
-            if hashes_to_revive:
-                self.metadata_store.mark_relations_active(hashes_to_revive, boost_weight=revive_boost)
-                self.metadata_store.update_relations_protection(
-                    hashes_to_revive, 
-                    protected_until=now + auto_protect, 
-                    last_reinforced=now
-                )
-                logger.info(f"复活记忆: {len(hashes_to_revive)} 条")
-                
-            if hashes_to_update:
-                self.metadata_store.update_relations_protection(
-                    hashes_to_update, 
-                    protected_until=now + auto_protect, 
-                    last_reinforced=now
-                )
-                
-        except Exception as e:
-            logger.error(f"处理强化批次失败: {e}")
+        await process_reinforce_batch_runtime(self, hashes=hashes)
 
     async def _process_freeze_and_prune(self):
         """处理冷冻与修剪"""
-        try:
-            prune_threshold = self.get_config("memory.prune_threshold", 0.1)
-            freeze_duration = self.get_config("memory.freeze_duration_hours", 24.0) * 3600
-            now = datetime.datetime.now().timestamp()
-            
-            # 1. 冷冻阶段 (FREEZE PASS) (不活跃逻辑)
-            # 策略：如果一条边权重过低，且其下所有关系均无保护，则冻结该边。
-            # "冻结" = 在元数据中标记为不活跃 + 从邻接矩阵中移除 (但保留在 Map 中)。
-            # 只有当边被移除，该记忆才不会参与 PageRank，符合 "不活跃" 定义。
-            
-            # 从图中获取低权重边 (邻居矩阵)
-            low_edges = self.graph_store.get_low_weight_edges(prune_threshold)
-            
-            hashes_to_freeze = [] # 元数据更新列表
-            edges_to_deactivate = [] # 图邻域更新列表
-            
-            for src, tgt in low_edges:
-                src_canon = self.graph_store._canonicalize(src)
-                tgt_canon = self.graph_store._canonicalize(tgt)
-                if src_canon in self.graph_store._node_to_idx and tgt_canon in self.graph_store._node_to_idx:
-                    s_idx = self.graph_store._node_to_idx[src_canon]
-                    t_idx = self.graph_store._node_to_idx[tgt_canon]
-                    
-                    associated_hashes = self.graph_store._edge_hash_map.get((s_idx, t_idx), set())
-                    if not associated_hashes: continue
-                    
-                    # 检查保护状态 (Check Protection)
-                    statuses = self.metadata_store.get_relation_status_batch(list(associated_hashes))
-                    
-                    is_edge_protected = False
-                    current_edge_hashes = []
-                    
-                    for h, st in statuses.items():
-                        # 保护规则: 已置顶 (Pinned) 或 TTL 有效
-                        if st["is_pinned"] or (st["protected_until"] or 0) > now:
-                            is_edge_protected = True
-                            break
-                        # 如果已是不活跃状态则跳过 (虽然在已停用的低权重边中不应出现，但为了安全进行检查)
-                        if st["is_inactive"]:
-                            pass 
-                        current_edge_hashes.append(h)
-                            
-                    if not is_edge_protected and current_edge_hashes:
-                        # Freeze the whole edge
-                        hashes_to_freeze.extend(current_edge_hashes)
-                        edges_to_deactivate.append((src, tgt))
-                        
-            if hashes_to_freeze:
-                self.metadata_store.mark_relations_inactive(hashes_to_freeze, inactive_since=now)
-                # 仅从矩阵中移除 (保留在 Map 中)
-                self.graph_store.deactivate_edges(edges_to_deactivate)
-                logger.info(f"冷冻记忆: {len(hashes_to_freeze)} 条关系, 冻结 {len(edges_to_deactivate)} 条边")
-
-            # 2. 修剪阶段 (PRUNE PASS) (删除逻辑)
-            # 从元数据和 Map 中移除过期的不活跃关系。
-            cutoff = now - freeze_duration
-            expired_hashes = self.metadata_store.get_prune_candidates(cutoff)
-            
-            if expired_hashes:
-                cursor = self.metadata_store._conn.cursor()
-                placeholders = ",".join(["?"] * len(expired_hashes))
-                cursor.execute(f"SELECT hash, subject, object FROM relations WHERE hash IN ({placeholders})", expired_hashes)
-                
-                ops_to_prune = [] # List[(src, tgt, hash)] for GraphStore
-                actually_deleted_hashes = []
-                
-                for r in cursor.fetchall():
-                    h, s, o = r[0], r[1], r[2]
-                    # We need to remove this specific hash from map
-                    ops_to_prune.append((s, o, h))
-                    actually_deleted_hashes.append(h)
-                
-                # Update GraphStore (Map -> if empty -> Matrix)
-                # Note: Matrix entry should be already gone via Freeze, but prune_relation_hashes handles that safety.
-                if ops_to_prune:
-                    self.graph_store.prune_relation_hashes(ops_to_prune)
-                    
-                # 从元数据中备份并删除 (Backup and Delete in Metadata)
-                count = self.metadata_store.backup_and_delete_relations(actually_deleted_hashes)
-                # 同步删除关系向量，避免孤儿向量污染召回
-                if self.vector_store and actually_deleted_hashes:
-                    deleted_vec = self.vector_store.delete(actually_deleted_hashes)
-                    logger.info(
-                        "metric.orphan_vector_cleanup_count=%s prune_hashes=%s",
-                        deleted_vec,
-                        len(actually_deleted_hashes),
-                    )
-                logger.info(f"物理修剪: {count} 条记忆 (已清理映射)")
-
-        except Exception as e:
-            logger.error(f"处理冷冻与修剪失败: {e}")
+        await process_freeze_and_prune_runtime(self)
 
     async def _orphan_gc_phase(self):
-        """
-        孤儿节点回收阶段 (Orphan GC Phase)
-        策略: Mark & Sweep (标记-清除)
-        逻辑:
-        1. Mark: 找出孤儿(Active Degree=0 & 未冻结)，同时满足 Retention 要求的，标记为 is_deleted=1.
-        2. Sweep: 找出 is_deleted=1 且 deleted_at < now - grace 的，物理删除.
-        """
-        # Feature Toggle
-        orphan_config = self.get_config("memory.orphan", {})
-        if not orphan_config.get("enable_soft_delete", True):
-            return
-
-        try:
-            logger.debug("开始孤儿节点回收阶段 (GC Phase)...")
-            
-            # Configs
-            entity_retention = orphan_config.get("entity_retention_days", 7.0) * 86400
-            para_retention = orphan_config.get("paragraph_retention_days", 7.0) * 86400
-            grace_period = orphan_config.get("sweep_grace_hours", 24.0) * 3600
-            
-            # ==========================================================
-            # 1. MARK PHASE (标记)
-            # ==========================================================
-            
-            # 1.1 标记实体 (Mark Entities)
-            # 从图中获取孤儿候选者 (活跃但孤立)
-            # 注意: include_inactive=True (默认) 会排除掉那些虽然度为 0 但参与了冻结边的节点 -> 保护冻结节点不被删除
-            isolated_candidates = self.graph_store.get_isolated_nodes(include_inactive=True)
-            
-            if isolated_candidates:
-                # 通过元数据过滤 (保留时长与引用检查)
-                final_entity_candidates = self.metadata_store.get_entity_gc_candidates(
-                    isolated_candidates, 
-                    retention_seconds=entity_retention
-                )
-                
-                if final_entity_candidates:
-                    cnt = self.metadata_store.mark_as_deleted(final_entity_candidates, "entity")
-                    if cnt > 0:
-                        logger.info(f"[GC-Mark] 标记删除实体: {cnt} 个")
-
-            # 1.2 标记段落 (Mark Paragraphs)
-            # 通过元数据过滤 (保留时长 & 无关系 & 无实体)
-            para_candidates = self.metadata_store.get_paragraph_gc_candidates(retention_seconds=para_retention)
-            if para_candidates:
-                cnt = self.metadata_store.mark_as_deleted(para_candidates, "paragraph")
-                if cnt > 0:
-                    logger.info(f"[GC-Mark] 标记删除段落: {cnt} 个")
-                    
-            # ==========================================================
-            # 2. SWEEP PHASE (物理清理)
-            # ==========================================================
-            
-            # 2.1 清理段落 (Sweep Paragraphs)
-            dead_paragraphs_tuples = self.metadata_store.sweep_deleted_items("paragraph", grace_period)
-            if dead_paragraphs_tuples:
-                dead_para_hashes = [t[0] for t in dead_paragraphs_tuples]
-                count = self.metadata_store.physically_delete_paragraphs(dead_para_hashes)
-                if count > 0:
-                    logger.info(f"[GC-Sweep] 物理删除段落: {count} 个")
-
-            # 2.2 清理实体 (Sweep Entities)
-            dead_entities_tuples = self.metadata_store.sweep_deleted_items("entity", grace_period)
-            if dead_entities_tuples:
-                dead_entity_hashes = [t[0] for t in dead_entities_tuples]
-                dead_entity_names = [t[1] for t in dead_entities_tuples]
-                
-                # 关键顺序：先从图存储中删除 (内存/矩阵)，然后再从元数据中删除。
-                
-                # 1. 图存储删除 (需要名称) (GraphStore Delete)
-                self.graph_store.delete_nodes(dead_entity_names)
-                
-                # 2. 元数据存储删除 (需要哈希) (MetadataStore Delete)
-                count = self.metadata_store.physically_delete_entities(dead_entity_hashes)
-                if count > 0:
-                   logger.info(f"[GC-Sweep] 物理删除实体: {count} 个")
-
-        except Exception as e:
-            logger.error(f"孤儿节点回收失败: {e}")
-            import traceback
-            traceback.print_exc()
+        """孤儿节点回收阶段 (Orphan GC Phase)."""
+        await orphan_gc_phase_runtime(self)
 
 
 

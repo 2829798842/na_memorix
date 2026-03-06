@@ -14,8 +14,17 @@ from typing import Optional, Union, List, Dict, Any, Tuple
 from src.common.logger import get_logger
 from ..utils.hash import compute_hash, normalize_text
 from ..utils.time_parser import normalize_time_meta
+from .knowledge_types import (
+    KnowledgeType,
+    allowed_knowledge_type_values,
+    resolve_stored_knowledge_type,
+    validate_stored_knowledge_type,
+)
 
 logger = get_logger("A_Memorix.MetadataStore")
+
+
+SCHEMA_VERSION = 7
 
 
 class MetadataStore:
@@ -54,7 +63,12 @@ class MetadataStore:
 
         logger.info(f"MetadataStore 初始化: db={db_name}")
 
-    def connect(self, data_dir: Optional[Union[str, Path]] = None) -> None:
+    def connect(
+        self,
+        data_dir: Optional[Union[str, Path]] = None,
+        *,
+        enforce_schema: bool = True,
+    ) -> None:
         """
         连接到数据库
 
@@ -71,6 +85,7 @@ class MetadataStore:
         data_dir.mkdir(parents=True, exist_ok=True)
 
         db_path = data_dir / self.db_name
+        db_existed = db_path.exists()
         self._db_path = db_path
 
         # 连接数据库
@@ -90,9 +105,12 @@ class MetadataStore:
 
         logger.info(f"连接到数据库: {db_path}")
 
-        # 初始化表结构
+        # 初始化或校验 schema
         if not self._is_initialized:
-            self._initialize_tables()
+            if not db_existed:
+                self._initialize_tables()
+            if enforce_schema:
+                self._assert_schema_compatible(db_existed=db_existed)
             self._is_initialized = True
 
         # 初始化 FTS schema（幂等）
@@ -100,6 +118,30 @@ class MetadataStore:
             self.ensure_fts_schema()
         except Exception as e:
             logger.warning(f"初始化 FTS schema 失败，将跳过 BM25 检索: {e}")
+
+    def _assert_schema_compatible(self, db_existed: bool) -> None:
+        """vNext 运行时只做 schema 版本校验，不做隐式迁移。"""
+        cursor = self._conn.cursor()
+        cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_migrations'"
+        )
+        has_version_table = cursor.fetchone() is not None
+        if not has_version_table:
+            if db_existed:
+                raise RuntimeError(
+                    "检测到旧版 metadata schema（缺少 schema_migrations）。"
+                    " 请先执行 scripts/release_vnext_migrate.py migrate。"
+                )
+            return
+
+        cursor.execute("SELECT MAX(version) FROM schema_migrations")
+        row = cursor.fetchone()
+        version = int(row[0]) if row and row[0] is not None else 0
+        if version != SCHEMA_VERSION:
+            raise RuntimeError(
+                f"metadata schema 版本不匹配: current={version}, expected={SCHEMA_VERSION}。"
+                " 请执行 scripts/release_vnext_migrate.py migrate。"
+            )
 
     def close(self) -> None:
         """关闭数据库连接"""
@@ -128,7 +170,12 @@ class MetadataStore:
                 event_time_end REAL,
                 time_granularity TEXT,
                 time_confidence REAL DEFAULT 1.0,
-                knowledge_type TEXT DEFAULT 'mixed'
+                knowledge_type TEXT DEFAULT 'mixed',
+                is_permanent BOOLEAN DEFAULT 0,
+                last_accessed REAL,
+                access_count INTEGER DEFAULT 0,
+                is_deleted INTEGER DEFAULT 0,
+                deleted_at REAL
             )
         """)
 
@@ -140,7 +187,9 @@ class MetadataStore:
                 vector_index INTEGER,
                 appearance_count INTEGER DEFAULT 1,
                 created_at REAL,
-                metadata TEXT
+                metadata TEXT,
+                is_deleted INTEGER DEFAULT 0,
+                deleted_at REAL
             )
         """)
 
@@ -160,7 +209,59 @@ class MetadataStore:
                 created_at REAL,
                 source_paragraph TEXT,
                 metadata TEXT,
+                is_permanent BOOLEAN DEFAULT 0,
+                last_accessed REAL,
+                access_count INTEGER DEFAULT 0,
+                is_inactive BOOLEAN DEFAULT 0,
+                inactive_since REAL,
+                is_pinned BOOLEAN DEFAULT 0,
+                protected_until REAL,
+                last_reinforced REAL,
                 UNIQUE(subject, predicate, object)
+            )
+        """)
+
+        # 回收站关系表
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS deleted_relations (
+                hash TEXT PRIMARY KEY,
+                subject TEXT NOT NULL,
+                predicate TEXT NOT NULL,
+                object TEXT NOT NULL,
+                vector_index INTEGER,
+                confidence REAL DEFAULT 1.0,
+                vector_state TEXT DEFAULT 'none',
+                vector_updated_at REAL,
+                vector_error TEXT,
+                vector_retry_count INTEGER DEFAULT 0,
+                created_at REAL,
+                source_paragraph TEXT,
+                metadata TEXT,
+                is_permanent BOOLEAN DEFAULT 0,
+                last_accessed REAL,
+                access_count INTEGER DEFAULT 0,
+                is_inactive BOOLEAN DEFAULT 0,
+                inactive_since REAL,
+                is_pinned BOOLEAN DEFAULT 0,
+                protected_until REAL,
+                last_reinforced REAL,
+                deleted_at REAL
+            )
+        """)
+
+        # 32位哈希别名映射（用于 vNext 唯一解析）
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS relation_hash_aliases (
+                alias32 TEXT PRIMARY KEY,
+                hash TEXT NOT NULL
+            )
+        """)
+
+        # Schema 版本
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                version INTEGER PRIMARY KEY,
+                applied_at REAL NOT NULL
             )
         """)
 
@@ -215,6 +316,22 @@ class MetadataStore:
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_paragraphs_source
             ON paragraphs(source)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_paragraphs_deleted
+            ON paragraphs(is_deleted, deleted_at)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_entities_deleted
+            ON entities(is_deleted, deleted_at)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_relations_inactive
+            ON relations(is_inactive, inactive_since)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_relations_protected
+            ON relations(is_pinned, protected_until)
         """)
 
         # 人物画像开关表（按 stream_id + user_id 维度）
@@ -282,15 +399,199 @@ class MetadataStore:
             CREATE INDEX IF NOT EXISTS idx_person_profile_overrides_updated
             ON person_profile_overrides(updated_at DESC)
         """)
+
+        # Episode 情景记忆表
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS episodes (
+                episode_id TEXT PRIMARY KEY,
+                source TEXT,
+                title TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                event_time_start REAL,
+                event_time_end REAL,
+                time_granularity TEXT,
+                time_confidence REAL DEFAULT 1.0,
+                participants_json TEXT,
+                keywords_json TEXT,
+                evidence_ids_json TEXT,
+                paragraph_count INTEGER DEFAULT 0,
+                llm_confidence REAL DEFAULT 0.0,
+                segmentation_model TEXT,
+                segmentation_version TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+        """)
+
+        # Episode -> Paragraph 映射
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS episode_paragraphs (
+                episode_id TEXT NOT NULL,
+                paragraph_hash TEXT NOT NULL,
+                position INTEGER DEFAULT 0,
+                PRIMARY KEY (episode_id, paragraph_hash),
+                FOREIGN KEY (episode_id) REFERENCES episodes(episode_id) ON DELETE CASCADE,
+                FOREIGN KEY (paragraph_hash) REFERENCES paragraphs(hash) ON DELETE CASCADE
+            )
+        """)
+
+        # Episode 生成队列（异步）
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS episode_pending_paragraphs (
+                paragraph_hash TEXT PRIMARY KEY,
+                source TEXT,
+                created_at REAL,
+                status TEXT DEFAULT 'pending',
+                retry_count INTEGER DEFAULT 0,
+                last_error TEXT,
+                updated_at REAL NOT NULL
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS episode_rebuild_sources (
+                source TEXT PRIMARY KEY,
+                status TEXT DEFAULT 'pending',
+                retry_count INTEGER DEFAULT 0,
+                last_error TEXT,
+                reason TEXT,
+                requested_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+        """)
+
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_episodes_source_time_end
+            ON episodes(source, event_time_end DESC)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_episodes_updated_at
+            ON episodes(updated_at DESC)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_episode_paragraphs_paragraph
+            ON episode_paragraphs(paragraph_hash)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_episode_pending_status_updated
+            ON episode_pending_paragraphs(status, updated_at)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_episode_pending_source_created
+            ON episode_pending_paragraphs(source, created_at)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_episode_rebuild_status_updated
+            ON episode_rebuild_sources(status, updated_at)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_episode_rebuild_updated_at
+            ON episode_rebuild_sources(updated_at DESC)
+        """)
+        # 新版 schema 包含完整字段，直接写入版本信息
+        cursor.execute("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)", (SCHEMA_VERSION, datetime.now().timestamp()))
         self._conn.commit()
         logger.debug("数据库表结构初始化完成")
-        
-        # 执行schema迁移
-        self._migrate_schema()
 
     def _migrate_schema(self) -> None:
         """执行数据库schema迁移"""
         cursor = self._conn.cursor()
+
+        # vNext 关键表兜底：历史库可能缺失，需在迁移阶段主动补齐。
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS relation_hash_aliases (
+                alias32 TEXT PRIMARY KEY,
+                hash TEXT NOT NULL
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                version INTEGER PRIMARY KEY,
+                applied_at REAL NOT NULL
+            )
+        """)
+
+        # Episode MVP 表结构补齐
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS episodes (
+                episode_id TEXT PRIMARY KEY,
+                source TEXT,
+                title TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                event_time_start REAL,
+                event_time_end REAL,
+                time_granularity TEXT,
+                time_confidence REAL DEFAULT 1.0,
+                participants_json TEXT,
+                keywords_json TEXT,
+                evidence_ids_json TEXT,
+                paragraph_count INTEGER DEFAULT 0,
+                llm_confidence REAL DEFAULT 0.0,
+                segmentation_model TEXT,
+                segmentation_version TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS episode_paragraphs (
+                episode_id TEXT NOT NULL,
+                paragraph_hash TEXT NOT NULL,
+                position INTEGER DEFAULT 0,
+                PRIMARY KEY (episode_id, paragraph_hash),
+                FOREIGN KEY (episode_id) REFERENCES episodes(episode_id) ON DELETE CASCADE,
+                FOREIGN KEY (paragraph_hash) REFERENCES paragraphs(hash) ON DELETE CASCADE
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS episode_pending_paragraphs (
+                paragraph_hash TEXT PRIMARY KEY,
+                source TEXT,
+                created_at REAL,
+                status TEXT DEFAULT 'pending',
+                retry_count INTEGER DEFAULT 0,
+                last_error TEXT,
+                updated_at REAL NOT NULL
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS episode_rebuild_sources (
+                source TEXT PRIMARY KEY,
+                status TEXT DEFAULT 'pending',
+                retry_count INTEGER DEFAULT 0,
+                last_error TEXT,
+                reason TEXT,
+                requested_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_episodes_source_time_end
+            ON episodes(source, event_time_end DESC)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_episodes_updated_at
+            ON episodes(updated_at DESC)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_episode_paragraphs_paragraph
+            ON episode_paragraphs(paragraph_hash)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_episode_pending_status_updated
+            ON episode_pending_paragraphs(status, updated_at)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_episode_pending_source_created
+            ON episode_pending_paragraphs(source, created_at)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_episode_rebuild_status_updated
+            ON episode_rebuild_sources(status, updated_at)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_episode_rebuild_updated_at
+            ON episode_rebuild_sources(updated_at DESC)
+        """)
         
         # 检查paragraphs表是否有knowledge_type列
         cursor.execute("PRAGMA table_info(paragraphs)")
@@ -498,6 +799,90 @@ class MetadataStore:
             cursor.execute(
                 "CREATE INDEX IF NOT EXISTS idx_paragraphs_event_end ON paragraphs(event_time_end)"
             )
+
+    def run_legacy_migration_for_vnext(self) -> Dict[str, Any]:
+        """
+        离线迁移入口：
+        - 复用旧迁移逻辑补齐历史库字段
+        - 重建 relation 32位别名
+        - 归一化历史 knowledge_type
+        - 写入 vNext schema 版本
+        """
+        self._migrate_schema()
+        alias_result = self.rebuild_relation_hash_aliases()
+        knowledge_type_result = self.normalize_paragraph_knowledge_types()
+        self.set_schema_version(SCHEMA_VERSION)
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "alias_result": alias_result,
+            "knowledge_type_result": knowledge_type_result,
+        }
+
+    def list_invalid_paragraph_knowledge_types(self) -> List[str]:
+        """列出当前库中不合法的段落 knowledge_type。"""
+
+        cursor = self._conn.cursor()
+        cursor.execute(
+            """
+            SELECT DISTINCT knowledge_type
+            FROM paragraphs
+            WHERE knowledge_type IS NULL
+               OR TRIM(COALESCE(knowledge_type, '')) = ''
+               OR LOWER(TRIM(knowledge_type)) NOT IN ({placeholders})
+            ORDER BY knowledge_type
+            """.format(placeholders=", ".join("?" for _ in allowed_knowledge_type_values())),
+            tuple(allowed_knowledge_type_values()),
+        )
+        invalid: List[str] = []
+        for row in cursor.fetchall():
+            raw = row[0]
+            invalid.append(str(raw) if raw is not None else "")
+        return invalid
+
+    def normalize_paragraph_knowledge_types(self) -> Dict[str, Any]:
+        """将历史非法 knowledge_type 归一化为合法值。"""
+
+        cursor = self._conn.cursor()
+        cursor.execute("SELECT hash, content, knowledge_type FROM paragraphs")
+        rows = cursor.fetchall()
+
+        normalized_count = 0
+        normalized_map: Dict[str, int] = {}
+        invalid_before: List[str] = []
+        invalid_seen = set()
+
+        for row in rows:
+            paragraph_hash = str(row["hash"])
+            content = str(row["content"] or "")
+            raw_value = row["knowledge_type"]
+            try:
+                validate_stored_knowledge_type(raw_value)
+                continue
+            except ValueError:
+                raw_text = str(raw_value) if raw_value is not None else ""
+                if raw_text not in invalid_seen:
+                    invalid_seen.add(raw_text)
+                    invalid_before.append(raw_text)
+
+            normalized_type = resolve_stored_knowledge_type(
+                raw_value,
+                content=content,
+                allow_legacy=True,
+                unknown_fallback=KnowledgeType.MIXED,
+            )
+            cursor.execute(
+                "UPDATE paragraphs SET knowledge_type = ? WHERE hash = ?",
+                (normalized_type.value, paragraph_hash),
+            )
+            normalized_count += 1
+            normalized_map[normalized_type.value] = normalized_map.get(normalized_type.value, 0) + 1
+
+        self._conn.commit()
+        return {
+            "normalized": normalized_count,
+            "invalid_before": sorted(invalid_before),
+            "normalized_to": normalized_map,
+        }
 
     def _resolve_conn(self, conn: Optional[sqlite3.Connection] = None) -> sqlite3.Connection:
         """解析可用连接。"""
@@ -1019,6 +1404,79 @@ class MetadataStore:
         except sqlite3.OperationalError:
             pass
 
+    @staticmethod
+    def _normalize_episode_source(source: Any) -> str:
+        return str(source or "").strip()
+
+    def _dedupe_episode_sources(self, sources: List[Any]) -> List[str]:
+        normalized: List[str] = []
+        seen = set()
+        for item in sources or []:
+            token = self._normalize_episode_source(item)
+            if not token or token in seen:
+                continue
+            seen.add(token)
+            normalized.append(token)
+        return normalized
+
+    def _get_sources_for_paragraph_hashes(
+        self,
+        hashes: List[str],
+        *,
+        include_deleted: bool = True,
+    ) -> List[str]:
+        normalized_hashes = [
+            str(item or "").strip()
+            for item in (hashes or [])
+            if str(item or "").strip()
+        ]
+        if not normalized_hashes:
+            return []
+
+        placeholders = ",".join(["?"] * len(normalized_hashes))
+        conditions = ["hash IN ({})".format(placeholders), "TRIM(COALESCE(source, '')) != ''"]
+        if not include_deleted:
+            conditions.append("(is_deleted IS NULL OR is_deleted = 0)")
+
+        cursor = self._conn.cursor()
+        cursor.execute(
+            f"""
+            SELECT DISTINCT TRIM(source) AS source
+            FROM paragraphs
+            WHERE {' AND '.join(conditions)}
+            """,
+            tuple(normalized_hashes),
+        )
+        return self._dedupe_episode_sources([row["source"] for row in cursor.fetchall()])
+
+    def _enqueue_episode_source_rebuilds(self, sources: List[Any], reason: str = "") -> int:
+        normalized_sources = self._dedupe_episode_sources(sources)
+        if not normalized_sources:
+            return 0
+
+        now = datetime.now().timestamp()
+        reason_text = str(reason or "").strip()[:200] or None
+        cursor = self._conn.cursor()
+        cursor.executemany(
+            """
+            INSERT INTO episode_rebuild_sources (
+                source, status, retry_count, last_error, reason, requested_at, updated_at
+            ) VALUES (?, 'pending', 0, NULL, ?, ?, ?)
+            ON CONFLICT(source) DO UPDATE SET
+                status = 'pending',
+                last_error = NULL,
+                reason = excluded.reason,
+                requested_at = excluded.requested_at,
+                updated_at = excluded.updated_at
+            """,
+            [
+                (source, reason_text, now, now)
+                for source in normalized_sources
+            ],
+        )
+        self._conn.commit()
+        return len(normalized_sources)
+
     def add_paragraph(
         self,
         content: str,
@@ -1036,7 +1494,7 @@ class MetadataStore:
             vector_index: 向量索引
             source: 来源
             metadata: 额外元数据
-            knowledge_type: 知识类型 (structured/narrative/factual/mixed)
+            knowledge_type: 知识类型 (narrative/factual/quote/structured/mixed)
             time_meta: 时间元信息 (event_time/event_time_start/event_time_end/...)
 
         Returns:
@@ -1044,6 +1502,7 @@ class MetadataStore:
         """
         content_normalized = normalize_text(content)
         hash_value = compute_hash(content_normalized)
+        resolved_knowledge_type = validate_stored_knowledge_type(knowledge_type)
 
         now = datetime.now().timestamp()
         word_count = len(content_normalized.split())
@@ -1073,10 +1532,19 @@ class MetadataStore:
                 normalized_time.get("event_time_end"),
                 normalized_time.get("time_granularity"),
                 normalized_time.get("time_confidence", 1.0),
-                knowledge_type,
+                resolved_knowledge_type.value,
             ))
             self._conn.commit()
-            logger.debug(f"添加段落: hash={hash_value[:16]}..., words={word_count}, type={knowledge_type}")
+            try:
+                self.enqueue_episode_source_rebuild(
+                    source=source,
+                    reason="paragraph_added",
+                )
+            except Exception as e:
+                logger.warning(f"Episode source 重建入队失败: hash={hash_value[:16]}..., err={e}")
+            logger.debug(
+                f"添加段落: hash={hash_value[:16]}..., words={word_count}, type={resolved_knowledge_type.value}"
+            )
             return hash_value
         except sqlite3.IntegrityError:
             logger.debug(f"段落已存在: {hash_value[:16]}...")
@@ -1277,6 +1745,10 @@ class MetadataStore:
                 VALUES (?, ?)
             """, (paragraph_hash, relation_hash))
             self._conn.commit()
+            self._enqueue_episode_source_rebuilds(
+                self._get_sources_for_paragraph_hashes([paragraph_hash], include_deleted=True),
+                reason="paragraph_relation_linked",
+            )
             return True
         except sqlite3.IntegrityError:
             return False
@@ -1308,6 +1780,10 @@ class MetadataStore:
                 """, (mention_count, paragraph_hash, entity_hash))
             
             self._conn.commit()
+            self._enqueue_episode_source_rebuilds(
+                self._get_sources_for_paragraph_hashes([paragraph_hash], include_deleted=True),
+                reason="paragraph_entity_linked",
+            )
             return True
         except sqlite3.IntegrityError:
             return False
@@ -1343,6 +1819,10 @@ class MetadataStore:
         normalized = normalize_time_meta(time_meta)
         if not normalized:
             return False
+        source_to_rebuild = self._get_sources_for_paragraph_hashes(
+            [paragraph_hash],
+            include_deleted=True,
+        )
 
         updates: List[str] = []
         params: List[Any] = []
@@ -1370,7 +1850,13 @@ class MetadataStore:
             tuple(params),
         )
         self._conn.commit()
-        return cursor.rowcount > 0
+        changed = cursor.rowcount > 0
+        if changed:
+            self._enqueue_episode_source_rebuilds(
+                source_to_rebuild,
+                reason="paragraph_time_updated",
+            )
+        return changed
 
     def query_paragraphs_temporal(
         self,
@@ -2039,19 +2525,31 @@ class MetadataStore:
         """
         获取段落数量
         """
-        # 段落表目前由于级联删除是硬删除，此处仅为接口兼容
         cursor = self._conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM paragraphs")
+        if only_deleted:
+            cursor.execute("SELECT COUNT(*) FROM paragraphs WHERE is_deleted = 1")
+            return cursor.fetchone()[0]
+        if include_deleted:
+            cursor.execute("SELECT COUNT(*) FROM paragraphs")
+            return cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM paragraphs WHERE is_deleted = 0")
         return cursor.fetchone()[0]
 
     def count_relations(self, include_deleted: bool = False, only_deleted: bool = False) -> int:
         """
         获取关系数量
         """
-        # 关系表目前也是级联硬删除，此处仅为接口兼容
         cursor = self._conn.cursor()
+        if only_deleted:
+            cursor.execute("SELECT COUNT(*) FROM deleted_relations")
+            return cursor.fetchone()[0]
         cursor.execute("SELECT COUNT(*) FROM relations")
-        return cursor.fetchone()[0]
+        active_count = cursor.fetchone()[0]
+        if not include_deleted:
+            return active_count
+        cursor.execute("SELECT COUNT(*) FROM deleted_relations")
+        deleted_count = cursor.fetchone()[0]
+        return int(active_count) + int(deleted_count)
 
     def count_entities(self) -> int:
         """
@@ -2063,6 +2561,369 @@ class MetadataStore:
         cursor = self._conn.cursor()
         cursor.execute("SELECT COUNT(*) FROM entities")
         return cursor.fetchone()[0]
+
+    def get_knowledge_type_distribution(self) -> Dict[str, int]:
+        """获取段落知识类型分布。"""
+        cursor = self._conn.cursor()
+        cursor.execute(
+            """
+            SELECT knowledge_type, COUNT(*) as count
+            FROM paragraphs
+            WHERE is_deleted = 0
+            GROUP BY knowledge_type
+            """
+        )
+        result: Dict[str, int] = {}
+        for row in cursor.fetchall():
+            type_name = row[0] if row[0] else "未分类"
+            result[str(type_name)] = int(row[1] or 0)
+        return result
+
+    def get_memory_status_summary(self, now_ts: Optional[float] = None) -> Dict[str, int]:
+        """聚合 memory status 统计。"""
+        now_ts = float(now_ts) if now_ts is not None else datetime.now().timestamp()
+        cursor = self._conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM relations WHERE is_inactive = 0")
+        active_count = int(cursor.fetchone()[0] or 0)
+        cursor.execute("SELECT COUNT(*) FROM relations WHERE is_inactive = 1")
+        inactive_count = int(cursor.fetchone()[0] or 0)
+        cursor.execute("SELECT COUNT(*) FROM deleted_relations")
+        deleted_count = int(cursor.fetchone()[0] or 0)
+        cursor.execute("SELECT COUNT(*) FROM relations WHERE is_pinned = 1")
+        pinned_count = int(cursor.fetchone()[0] or 0)
+        cursor.execute("SELECT COUNT(*) FROM relations WHERE protected_until > ?", (now_ts,))
+        ttl_count = int(cursor.fetchone()[0] or 0)
+        return {
+            "active_count": active_count,
+            "inactive_count": inactive_count,
+            "deleted_count": deleted_count,
+            "pinned_count": pinned_count,
+            "temp_protected_count": ttl_count,
+        }
+
+    def get_relations_subject_object_map(self, hashes: List[str]) -> Dict[str, Tuple[str, str]]:
+        """批量获取关系 hash 对应的 (subject, object)。"""
+        if not hashes:
+            return {}
+        cursor = self._conn.cursor()
+        placeholders = ",".join(["?"] * len(hashes))
+        cursor.execute(
+            f"SELECT hash, subject, object FROM relations WHERE hash IN ({placeholders})",
+            hashes,
+        )
+        return {str(row[0]): (str(row[1]), str(row[2])) for row in cursor.fetchall()}
+
+    def get_connection(self) -> sqlite3.Connection:
+        """公开连接访问（用于离线脚本），替代外部访问私有字段。"""
+        return self._resolve_conn()
+
+    def get_relation_db_snapshot(self) -> Tuple[int, float, str]:
+        """返回关系快照：(relation_count, max_created_at, max_hash)。"""
+        cursor = self._conn.cursor()
+        cursor.execute(
+            """
+            SELECT
+                COUNT(*) AS relation_count,
+                COALESCE(MAX(created_at), 0) AS max_created_at,
+                COALESCE(MAX(hash), '') AS max_hash
+            FROM relations
+            """
+        )
+        row = cursor.fetchone()
+        if not row:
+            return (0, 0.0, "")
+        return (
+            int(row[0] or 0),
+            float(row[1] or 0.0),
+            str(row[2] or ""),
+        )
+
+    def is_entity_still_referenced(self, entity_hash: str, entity_name: str = "") -> bool:
+        """
+        判断实体是否仍被引用：
+        1) 被 paragraph_entities 引用
+        2) 在 relations.subject/object 中出现
+        """
+        token_hash = str(entity_hash or "").strip()
+        if token_hash:
+            cursor = self._conn.cursor()
+            cursor.execute(
+                "SELECT 1 FROM paragraph_entities WHERE entity_hash = ? LIMIT 1",
+                (token_hash,),
+            )
+            if cursor.fetchone() is not None:
+                return True
+
+        canon_name = self._canonicalize_name(entity_name)
+        if canon_name:
+            cursor = self._conn.cursor()
+            cursor.execute(
+                """
+                SELECT 1
+                FROM relations
+                WHERE LOWER(TRIM(subject)) = ? OR LOWER(TRIM(object)) = ?
+                LIMIT 1
+                """,
+                (canon_name, canon_name),
+            )
+            if cursor.fetchone() is not None:
+                return True
+        return False
+
+    def search_relations_by_subject_or_object(
+        self,
+        query: str,
+        *,
+        limit: int = 5,
+        include_deleted: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """按 subject/object 模糊查询关系。"""
+        q = str(query or "").strip()
+        if not q:
+            return []
+        max_limit = int(max(1, limit))
+        cursor = self._conn.cursor()
+        cursor.execute(
+            """
+            SELECT *
+            FROM relations
+            WHERE subject LIKE ? OR object LIKE ?
+            LIMIT ?
+            """,
+            (f"%{q}%", f"%{q}%", max_limit),
+        )
+        rows = [self._row_to_dict(row, "relation") for row in cursor.fetchall()]
+        if rows or not include_deleted:
+            return rows
+
+        cursor.execute(
+            """
+            SELECT *
+            FROM deleted_relations
+            WHERE subject LIKE ? OR object LIKE ?
+            LIMIT ?
+            """,
+            (f"%{q}%", f"%{q}%", max_limit),
+        )
+        return [self._row_to_dict(row, "relation") for row in cursor.fetchall()]
+
+    def list_hashes(self, table: str) -> List[str]:
+        """安全枚举指定表的 hash 列。"""
+        allowed = {"paragraphs", "entities", "relations", "deleted_relations"}
+        token = str(table or "").strip().lower()
+        if token not in allowed:
+            raise ValueError(f"unsupported table for list_hashes: {table}")
+        cursor = self._conn.cursor()
+        cursor.execute(f"SELECT hash FROM {token}")
+        return [str(row[0]) for row in cursor.fetchall()]
+
+    def get_orphan_deleted_relation_hashes(self, limit: int = 200) -> List[str]:
+        """获取 deleted_relations 中已不在 relations 的孤儿 hash。"""
+        cursor = self._conn.cursor()
+        cursor.execute(
+            """
+            SELECT d.hash
+            FROM deleted_relations d
+            LEFT JOIN relations r ON r.hash = d.hash
+            WHERE r.hash IS NULL
+            LIMIT ?
+            """,
+            (int(max(1, limit)),),
+        )
+        return [str(row[0]) for row in cursor.fetchall()]
+
+    def resolve_relation_hash_alias(
+        self,
+        value: str,
+        *,
+        include_deleted: bool = False,
+    ) -> List[str]:
+        """
+        解析关系哈希输入：
+        - 64位：直接校验存在性
+        - 32位：通过 relation_hash_aliases 唯一映射
+        """
+        token = str(value or "").strip().lower()
+        if not token:
+            return []
+        if len(token) == 64 and all(ch in "0123456789abcdef" for ch in token):
+            cursor = self._conn.cursor()
+            cursor.execute("SELECT 1 FROM relations WHERE hash = ? LIMIT 1", (token,))
+            if cursor.fetchone():
+                return [token]
+            if include_deleted:
+                cursor.execute("SELECT 1 FROM deleted_relations WHERE hash = ? LIMIT 1", (token,))
+                if cursor.fetchone():
+                    return [token]
+            return []
+
+        if len(token) != 32 or not all(ch in "0123456789abcdef" for ch in token):
+            return []
+
+        cursor = self._conn.cursor()
+        cursor.execute("SELECT hash FROM relation_hash_aliases WHERE alias32 = ?", (token,))
+        row = cursor.fetchone()
+        if not row:
+            return []
+        resolved = str(row[0])
+        return [resolved]
+
+    def rebuild_relation_hash_aliases(self) -> Dict[str, Any]:
+        """重建 32 位 relation hash 别名映射。"""
+        cursor = self._conn.cursor()
+        # 历史库兜底：缺表时先创建，避免迁移过程直接中断。
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS relation_hash_aliases (
+                alias32 TEXT PRIMARY KEY,
+                hash TEXT NOT NULL
+            )
+        """)
+        cursor.execute("DELETE FROM relation_hash_aliases")
+
+        cursor.execute("SELECT hash FROM relations")
+        hashes = [str(r[0]) for r in cursor.fetchall()]
+        cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='deleted_relations'"
+        )
+        has_deleted_relations = cursor.fetchone() is not None
+        if has_deleted_relations:
+            cursor.execute("SELECT hash FROM deleted_relations")
+            hashes.extend(str(r[0]) for r in cursor.fetchall())
+
+        alias_map: Dict[str, str] = {}
+        conflicts: Dict[str, set[str]] = {}
+        for h in hashes:
+            if len(h) != 64:
+                continue
+            alias = h[:32]
+            old = alias_map.get(alias)
+            if old is None:
+                alias_map[alias] = h
+            elif old != h:
+                conflicts.setdefault(alias, set()).update({old, h})
+
+        for alias, full_hash in alias_map.items():
+            if alias in conflicts:
+                continue
+            cursor.execute(
+                "INSERT INTO relation_hash_aliases(alias32, hash) VALUES (?, ?)",
+                (alias, full_hash),
+            )
+        self._conn.commit()
+        return {
+            "inserted": len(alias_map) - len(conflicts),
+            "conflict_count": len(conflicts),
+            "conflicts": sorted(conflicts.keys()),
+        }
+
+    def search_relation_hashes_by_text(self, query: str, limit: int = 5) -> List[str]:
+        """按 relation 内容模糊查询 hash。"""
+        q = str(query or "").strip()
+        if not q:
+            return []
+        cursor = self._conn.cursor()
+        cursor.execute(
+            "SELECT hash FROM relations WHERE subject LIKE ? OR object LIKE ? LIMIT ?",
+            (f"%{q}%", f"%{q}%", int(max(1, limit))),
+        )
+        return [str(row[0]) for row in cursor.fetchall()]
+
+    def search_deleted_relation_hashes_by_text(self, query: str, limit: int = 5) -> List[str]:
+        """按 deleted_relations 内容模糊查询 hash。"""
+        q = str(query or "").strip()
+        if not q:
+            return []
+        cursor = self._conn.cursor()
+        cursor.execute(
+            "SELECT hash FROM deleted_relations WHERE subject LIKE ? OR object LIKE ? LIMIT ?",
+            (f"%{q}%", f"%{q}%", int(max(1, limit))),
+        )
+        return [str(row[0]) for row in cursor.fetchall()]
+
+    def restore_entity_by_hash(self, entity_hash: str) -> bool:
+        """恢复软删除实体。"""
+        cursor = self._conn.cursor()
+        cursor.execute(
+            "UPDATE entities SET is_deleted=0, deleted_at=NULL WHERE hash=?",
+            (str(entity_hash),),
+        )
+        changed = cursor.rowcount > 0
+        if changed:
+            self._conn.commit()
+        return changed
+
+    def backfill_temporal_metadata_from_created_at(
+        self,
+        *,
+        limit: int = 100000,
+        dry_run: bool = False,
+        no_created_fallback: bool = False,
+    ) -> Dict[str, int]:
+        """回填段落 event_time 字段（created_at 兜底）。"""
+        cursor = self._conn.cursor()
+        cursor.execute(
+            """
+            SELECT hash, created_at, source
+            FROM paragraphs
+            WHERE (event_time IS NULL AND event_time_start IS NULL AND event_time_end IS NULL)
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (int(max(1, limit)),),
+        )
+        rows = cursor.fetchall()
+        candidates = len(rows)
+        if dry_run:
+            return {"candidates": candidates, "updated": 0}
+        if no_created_fallback:
+            return {"candidates": candidates, "updated": 0}
+
+        updated = 0
+        touched_sources: List[str] = []
+        for row in rows:
+            created_at = row["created_at"]
+            if created_at is None:
+                continue
+            cursor.execute(
+                """
+                UPDATE paragraphs
+                SET event_time = ?, time_granularity = ?, time_confidence = ?, updated_at = ?
+                WHERE hash = ?
+                """,
+                (float(created_at), "day", 0.2, float(created_at), row["hash"]),
+            )
+            if cursor.rowcount > 0:
+                updated += 1
+                touched_sources.append(row["source"])
+        self._conn.commit()
+        if updated > 0:
+            self._enqueue_episode_source_rebuilds(
+                touched_sources,
+                reason="paragraph_time_backfill",
+            )
+        return {"candidates": candidates, "updated": updated}
+
+    def get_schema_version(self) -> int:
+        cursor = self._conn.cursor()
+        cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_migrations'"
+        )
+        if cursor.fetchone() is None:
+            return 0
+        cursor.execute("SELECT MAX(version) FROM schema_migrations")
+        row = cursor.fetchone()
+        return int(row[0]) if row and row[0] is not None else 0
+
+    def set_schema_version(self, version: int = SCHEMA_VERSION) -> None:
+        cursor = self._conn.cursor()
+        cursor.execute(
+            "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at REAL NOT NULL)"
+        )
+        cursor.execute(
+            "INSERT OR REPLACE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+            (int(version), datetime.now().timestamp()),
+        )
+        self._conn.commit()
 
     def delete_paragraph_atomic(self, paragraph_hash: str) -> Dict[str, Any]:
         """
@@ -2078,7 +2939,8 @@ class MetadataStore:
             "paragraph_hash": paragraph_hash,
             "vector_id_to_remove": None,
             "edges_to_remove": [],  # (src, tgt) 元组列表 (fallback)
-            "relation_prune_ops": []  # (subject, object, relation_hash) 精准裁剪
+            "relation_prune_ops": [],  # (subject, object, relation_hash) 精准裁剪
+            "episode_sources_to_rebuild": [],
         }
 
         cursor = self._conn.cursor()
@@ -2092,9 +2954,13 @@ class MetadataStore:
             candidate_relations = [row[0] for row in cursor.fetchall()]
 
             # 2. [快照] 确认该段落存在并记录 ID 用于向量删除
-            cursor.execute("SELECT hash FROM paragraphs WHERE hash = ?", (paragraph_hash,))
-            if cursor.fetchone():
+            cursor.execute("SELECT hash, source FROM paragraphs WHERE hash = ?", (paragraph_hash,))
+            paragraph_row = cursor.fetchone()
+            if paragraph_row:
                 cleanup_plan["vector_id_to_remove"] = paragraph_hash
+                cleanup_plan["episode_sources_to_rebuild"] = self._dedupe_episode_sources(
+                    [paragraph_row["source"]]
+                )
 
             # 3. [主删除] 删除段落 (触发 CASCADE 删 paragraph_relations)
             cursor.execute("DELETE FROM paragraphs WHERE hash = ?", (paragraph_hash,))
@@ -2136,6 +3002,11 @@ class MetadataStore:
                 cursor.execute(f"DELETE FROM relations WHERE hash IN ({placeholders})", orphaned_hashes)
 
             self._conn.commit()
+            if cleanup_plan["episode_sources_to_rebuild"]:
+                self._enqueue_episode_source_rebuilds(
+                    cleanup_plan["episode_sources_to_rebuild"],
+                    reason="paragraph_deleted",
+                )
             if cleanup_plan["vector_id_to_remove"]:
                 logger.debug(f"原子删除段落成功: {paragraph_hash}, 计划清理 {len(orphaned_hashes)} 个孤儿关系")
             return cleanup_plan
@@ -2150,8 +3021,10 @@ class MetadataStore:
         """清空所有表数据"""
         cursor = self._conn.cursor()
         tables = [
-            "paragraphs", "entities", "relations", 
-            "paragraph_relations", "paragraph_entities"
+            "paragraphs", "entities", "relations",
+            "paragraph_relations", "paragraph_entities",
+            "episodes", "episode_paragraphs",
+            "episode_rebuild_sources", "episode_pending_paragraphs",
         ]
         for table in tables:
             cursor.execute(f"DELETE FROM {table}")
@@ -2683,6 +3556,9 @@ class MetadataStore:
             
         table = "entities" if type_ == "entity" else "paragraphs"
         now = datetime.now().timestamp()
+        touched_sources: List[str] = []
+        if type_ == "paragraph":
+            touched_sources = self._get_sources_for_paragraph_hashes(hashes, include_deleted=True)
         
         count = 0
         batch_size = 900
@@ -2700,6 +3576,11 @@ class MetadataStore:
             count += cursor.rowcount
             
         self._conn.commit()
+        if type_ == "paragraph" and count > 0:
+            self._enqueue_episode_source_rebuilds(
+                touched_sources,
+                reason="paragraph_soft_deleted",
+            )
         if count > 0:
             logger.info(f"软删除标记 ({table}): {count} 项")
         return count
@@ -2750,6 +3631,7 @@ class MetadataStore:
     def physically_delete_paragraphs(self, hashes: List[str]) -> int:
         """物理删除段落 (批量)"""
         if not hashes: return 0
+        touched_sources = self._get_sources_for_paragraph_hashes(hashes, include_deleted=True)
         
         count = 0
         batch_size = 900
@@ -2762,6 +3644,11 @@ class MetadataStore:
             count += cursor.rowcount
             
         self._conn.commit()
+        if count > 0:
+            self._enqueue_episode_source_rebuilds(
+                touched_sources,
+                reason="paragraph_physically_deleted",
+            )
         return count
 
     def revive_if_deleted(self, entity_hashes: List[str] = None, paragraph_hashes: List[str] = None) -> int:
@@ -2786,6 +3673,7 @@ class MetadataStore:
                 count += cursor.rowcount
                 
         if paragraph_hashes:
+            touched_sources = self._get_sources_for_paragraph_hashes(paragraph_hashes, include_deleted=True)
             batch_size = 900
             for i in range(0, len(paragraph_hashes), batch_size):
                 batch = paragraph_hashes[i:i+batch_size]
@@ -2798,9 +3686,16 @@ class MetadataStore:
                     WHERE is_deleted = 1 AND hash IN ({placeholders})
                 """, batch)
                 count += cursor.rowcount
+        else:
+            touched_sources = []
         
         if count > 0:
             self._conn.commit()
+            if touched_sources:
+                self._enqueue_episode_source_rebuilds(
+                    touched_sources,
+                    reason="paragraph_revived",
+                )
             logger.info(f"自动复活: {count} 项 (Soft Delete Revived)")
             
         return count
@@ -3162,6 +4057,1020 @@ class MetadataStore:
         )
         self._conn.commit()
         return cursor.rowcount > 0
+
+    # =========================================================================
+    # Episode MVP
+    # =========================================================================
+
+    def enqueue_episode_source_rebuild(self, source: str, reason: str = "") -> bool:
+        """将 source 入队到 episode 重建队列。"""
+        return bool(self._enqueue_episode_source_rebuilds([source], reason=reason))
+
+    def fetch_episode_source_rebuild_batch(
+        self,
+        limit: int = 20,
+        max_retry: int = 3,
+    ) -> List[Dict[str, Any]]:
+        """获取待处理的 source 重建任务。"""
+        safe_limit = max(1, int(limit))
+        safe_retry = max(0, int(max_retry))
+        cursor = self._conn.cursor()
+        cursor.execute(
+            """
+            SELECT source, status, retry_count, last_error, reason, requested_at, updated_at
+            FROM episode_rebuild_sources
+            WHERE status = 'pending'
+               OR (status = 'failed' AND retry_count < ?)
+            ORDER BY requested_at ASC, updated_at ASC
+            LIMIT ?
+            """,
+            (safe_retry, safe_limit),
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+    def mark_episode_source_running(
+        self,
+        source: str,
+        *,
+        requested_at: Optional[float] = None,
+    ) -> bool:
+        """将 source 标记为 running。"""
+        token = self._normalize_episode_source(source)
+        if not token:
+            return False
+
+        now = datetime.now().timestamp()
+        cursor = self._conn.cursor()
+        params: List[Any] = [now, token]
+        sql = """
+            UPDATE episode_rebuild_sources
+            SET status = 'running',
+                updated_at = ?
+            WHERE source = ?
+              AND status IN ('pending', 'failed')
+        """
+        if requested_at is not None:
+            sql += " AND requested_at = ?"
+            params.append(float(requested_at))
+        cursor.execute(sql, tuple(params))
+        self._conn.commit()
+        return cursor.rowcount > 0
+
+    def mark_episode_source_done(
+        self,
+        source: str,
+        *,
+        requested_at: Optional[float] = None,
+    ) -> bool:
+        """将 source 标记为 done；若运行期间发生新写入，则保持 pending。"""
+        token = self._normalize_episode_source(source)
+        if not token:
+            return False
+
+        now = datetime.now().timestamp()
+        cursor = self._conn.cursor()
+        if requested_at is None:
+            cursor.execute(
+                """
+                UPDATE episode_rebuild_sources
+                SET status = 'done',
+                    last_error = NULL,
+                    updated_at = ?
+                WHERE source = ?
+                """,
+                (now, token),
+            )
+        else:
+            req_ts = float(requested_at)
+            cursor.execute(
+                """
+                UPDATE episode_rebuild_sources
+                SET status = CASE
+                        WHEN requested_at > ? THEN 'pending'
+                        ELSE 'done'
+                    END,
+                    last_error = NULL,
+                    updated_at = ?
+                WHERE source = ?
+                """,
+                (req_ts, now, token),
+            )
+        self._conn.commit()
+        return cursor.rowcount > 0
+
+    def mark_episode_source_failed(
+        self,
+        source: str,
+        error: str = "",
+        *,
+        requested_at: Optional[float] = None,
+    ) -> bool:
+        """标记 source 失败；若运行期间发生新写入，则重新回到 pending。"""
+        token = self._normalize_episode_source(source)
+        if not token:
+            return False
+
+        err_text = str(error or "").strip()[:500]
+        now = datetime.now().timestamp()
+        cursor = self._conn.cursor()
+        if requested_at is None:
+            cursor.execute(
+                """
+                UPDATE episode_rebuild_sources
+                SET status = 'failed',
+                    retry_count = COALESCE(retry_count, 0) + 1,
+                    last_error = ?,
+                    updated_at = ?
+                WHERE source = ?
+                """,
+                (err_text, now, token),
+            )
+        else:
+            req_ts = float(requested_at)
+            cursor.execute(
+                """
+                UPDATE episode_rebuild_sources
+                SET status = CASE
+                        WHEN requested_at > ? THEN 'pending'
+                        ELSE 'failed'
+                    END,
+                    retry_count = CASE
+                        WHEN requested_at > ? THEN COALESCE(retry_count, 0)
+                        ELSE COALESCE(retry_count, 0) + 1
+                    END,
+                    last_error = CASE
+                        WHEN requested_at > ? THEN NULL
+                        ELSE ?
+                    END,
+                    updated_at = ?
+                WHERE source = ?
+                """,
+                (req_ts, req_ts, req_ts, err_text, now, token),
+            )
+        self._conn.commit()
+        return cursor.rowcount > 0
+
+    def list_episode_source_rebuilds(
+        self,
+        *,
+        statuses: Optional[List[str]] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """列出 source 重建状态。"""
+        safe_limit = max(1, int(limit))
+        params: List[Any] = []
+        conditions: List[str] = []
+        normalized_statuses = [
+            str(item or "").strip().lower()
+            for item in (statuses or [])
+            if str(item or "").strip().lower() in {"pending", "running", "done", "failed"}
+        ]
+        if normalized_statuses:
+            placeholders = ",".join(["?"] * len(normalized_statuses))
+            conditions.append(f"status IN ({placeholders})")
+            params.extend(normalized_statuses)
+
+        where_sql = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        params.append(safe_limit)
+        cursor = self._conn.cursor()
+        cursor.execute(
+            f"""
+            SELECT source, status, retry_count, last_error, reason, requested_at, updated_at
+            FROM episode_rebuild_sources
+            {where_sql}
+            ORDER BY updated_at DESC, source ASC
+            LIMIT ?
+            """,
+            tuple(params),
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+    def get_episode_source_rebuild_summary(self, failed_limit: int = 20) -> Dict[str, Any]:
+        """汇总 source 重建队列状态。"""
+        cursor = self._conn.cursor()
+        cursor.execute(
+            """
+            SELECT status, COUNT(*) AS cnt
+            FROM episode_rebuild_sources
+            GROUP BY status
+            """
+        )
+        counts = {"pending": 0, "running": 0, "done": 0, "failed": 0, "total": 0}
+        for row in cursor.fetchall():
+            status = str(row["status"] or "").strip().lower()
+            cnt = int(row["cnt"] or 0)
+            counts[status] = counts.get(status, 0) + cnt
+            counts["total"] += cnt
+
+        running = self.list_episode_source_rebuilds(statuses=["running"], limit=20)
+        failed = self.list_episode_source_rebuilds(
+            statuses=["failed"],
+            limit=max(1, int(failed_limit)),
+        )
+        return {
+            "counts": counts,
+            "running": running,
+            "failed": failed,
+        }
+
+    def get_live_paragraphs_by_source(self, source: str) -> List[Dict[str, Any]]:
+        """获取指定 source 下所有 live paragraphs。"""
+        token = self._normalize_episode_source(source)
+        if not token:
+            return []
+        cursor = self._conn.cursor()
+        cursor.execute(
+            """
+            SELECT *
+            FROM paragraphs
+            WHERE TRIM(COALESCE(source, '')) = ?
+              AND (is_deleted IS NULL OR is_deleted = 0)
+            ORDER BY created_at ASC, hash ASC
+            """,
+            (token,),
+        )
+        return [self._row_to_dict(row, "paragraph") for row in cursor.fetchall()]
+
+    def list_episode_sources_for_rebuild(self) -> List[str]:
+        """列出全量重建涉及的 source（live paragraphs + stale episodes）。"""
+        cursor = self._conn.cursor()
+        cursor.execute(
+            """
+            SELECT DISTINCT source
+            FROM (
+                SELECT TRIM(source) AS source
+                FROM paragraphs
+                WHERE TRIM(COALESCE(source, '')) != ''
+                  AND (is_deleted IS NULL OR is_deleted = 0)
+                UNION
+                SELECT TRIM(source) AS source
+                FROM episodes
+                WHERE TRIM(COALESCE(source, '')) != ''
+            )
+            WHERE TRIM(COALESCE(source, '')) != ''
+            ORDER BY source ASC
+            """
+        )
+        return self._dedupe_episode_sources([row["source"] for row in cursor.fetchall()])
+
+    def is_episode_source_query_blocked(self, source: str) -> bool:
+        """判断 source 是否处于重建中或失败状态。"""
+        token = self._normalize_episode_source(source)
+        if not token:
+            return False
+        cursor = self._conn.cursor()
+        cursor.execute(
+            """
+            SELECT 1
+            FROM episode_rebuild_sources
+            WHERE source = ?
+              AND status IN ('pending', 'running', 'failed')
+            LIMIT 1
+            """,
+            (token,),
+        )
+        return cursor.fetchone() is not None
+
+    def replace_episodes_for_source(
+        self,
+        source: str,
+        episodes_payloads: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """按 source 全量替换 episode 结果。"""
+        token = self._normalize_episode_source(source)
+        if not token:
+            return {"source": "", "episode_count": 0}
+
+        payloads = [dict(item) for item in (episodes_payloads or []) if isinstance(item, dict)]
+        now = datetime.now().timestamp()
+        cursor = self._conn.cursor()
+
+        try:
+            cursor.execute("BEGIN IMMEDIATE")
+            cursor.execute(
+                """
+                SELECT episode_id, created_at
+                FROM episodes
+                WHERE TRIM(COALESCE(source, '')) = ?
+                """,
+                (token,),
+            )
+            existing_created_at = {
+                str(row["episode_id"]): self._as_optional_float(row["created_at"])
+                for row in cursor.fetchall()
+            }
+
+            cursor.execute(
+                "DELETE FROM episodes WHERE TRIM(COALESCE(source, '')) = ?",
+                (token,),
+            )
+
+            inserted_count = 0
+            for raw_payload in payloads:
+                title = str(raw_payload.get("title", "") or "").strip()
+                summary = str(raw_payload.get("summary", "") or "").strip()
+                evidence_ids = [
+                    str(item).strip()
+                    for item in (raw_payload.get("evidence_ids") or [])
+                    if str(item).strip()
+                ]
+                evidence_ids = list(dict.fromkeys(evidence_ids))
+                if not title or not summary or not evidence_ids:
+                    continue
+
+                episode_id = str(raw_payload.get("episode_id", "") or "").strip()
+                if not episode_id:
+                    seed = json.dumps(
+                        {
+                            "source": token,
+                            "title": title,
+                            "summary": summary,
+                            "event_time_start": raw_payload.get("event_time_start"),
+                            "event_time_end": raw_payload.get("event_time_end"),
+                            "evidence_ids": evidence_ids,
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                    episode_id = compute_hash(seed)
+
+                participants = [
+                    str(item).strip()
+                    for item in (raw_payload.get("participants") or [])
+                    if str(item).strip()
+                ][:16]
+                keywords = [
+                    str(item).strip()
+                    for item in (raw_payload.get("keywords") or [])
+                    if str(item).strip()
+                ][:20]
+                paragraph_count = raw_payload.get("paragraph_count", len(evidence_ids))
+                try:
+                    paragraph_count = max(0, int(paragraph_count))
+                except Exception:
+                    paragraph_count = len(evidence_ids)
+                if paragraph_count <= 0:
+                    paragraph_count = len(evidence_ids)
+                if paragraph_count <= 0:
+                    continue
+
+                time_confidence = raw_payload.get("time_confidence", 1.0)
+                llm_confidence = raw_payload.get("llm_confidence", 0.0)
+                try:
+                    time_confidence = float(time_confidence)
+                except Exception:
+                    time_confidence = 1.0
+                try:
+                    llm_confidence = float(llm_confidence)
+                except Exception:
+                    llm_confidence = 0.0
+
+                created_at = existing_created_at.get(episode_id)
+                created_ts = created_at if created_at is not None else now
+                updated_ts = self._as_optional_float(raw_payload.get("updated_at")) or now
+
+                cursor.execute(
+                    """
+                    INSERT INTO episodes (
+                        episode_id, source, title, summary,
+                        event_time_start, event_time_end, time_granularity, time_confidence,
+                        participants_json, keywords_json, evidence_ids_json,
+                        paragraph_count, llm_confidence, segmentation_model, segmentation_version,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        episode_id,
+                        token,
+                        title[:120],
+                        summary[:2000],
+                        self._as_optional_float(raw_payload.get("event_time_start")),
+                        self._as_optional_float(raw_payload.get("event_time_end")),
+                        str(raw_payload.get("time_granularity", "") or "").strip() or None,
+                        time_confidence,
+                        json.dumps(participants, ensure_ascii=False),
+                        json.dumps(keywords, ensure_ascii=False),
+                        json.dumps(evidence_ids, ensure_ascii=False),
+                        paragraph_count,
+                        llm_confidence,
+                        str(raw_payload.get("segmentation_model", "") or "").strip() or None,
+                        str(raw_payload.get("segmentation_version", "") or "").strip() or None,
+                        created_ts,
+                        updated_ts,
+                    ),
+                )
+                cursor.executemany(
+                    """
+                    INSERT OR IGNORE INTO episode_paragraphs (episode_id, paragraph_hash, position)
+                    VALUES (?, ?, ?)
+                    """,
+                    [(episode_id, hash_value, idx) for idx, hash_value in enumerate(evidence_ids)],
+                )
+                inserted_count += 1
+
+            self._conn.commit()
+            return {"source": token, "episode_count": inserted_count}
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def enqueue_episode_pending(
+        self,
+        paragraph_hash: str,
+        source: Optional[str] = None,
+        created_at: Optional[float] = None,
+    ) -> None:
+        """将段落入队到 episode 异步生成队列。"""
+        token = str(paragraph_hash or "").strip()
+        if not token:
+            return
+        now = datetime.now().timestamp()
+        created_ts = float(created_at) if created_at is not None else now
+        src = str(source or "").strip() or None
+
+        cursor = self._conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO episode_pending_paragraphs (
+                paragraph_hash, source, created_at, status, retry_count, last_error, updated_at
+            ) VALUES (?, ?, ?, 'pending', 0, NULL, ?)
+            ON CONFLICT(paragraph_hash) DO UPDATE SET
+                source = excluded.source,
+                created_at = COALESCE(episode_pending_paragraphs.created_at, excluded.created_at),
+                status = CASE
+                    WHEN episode_pending_paragraphs.status = 'done' THEN 'done'
+                    ELSE 'pending'
+                END,
+                last_error = CASE
+                    WHEN episode_pending_paragraphs.status = 'done' THEN episode_pending_paragraphs.last_error
+                    ELSE NULL
+                END,
+                updated_at = excluded.updated_at
+            """,
+            (token, src, created_ts, now),
+        )
+        self._conn.commit()
+
+    def fetch_episode_pending_batch(self, limit: int = 20, max_retry: int = 3) -> List[Dict[str, Any]]:
+        """获取待处理 episode 队列批次。"""
+        safe_limit = max(1, int(limit))
+        safe_retry = max(0, int(max_retry))
+        cursor = self._conn.cursor()
+        cursor.execute(
+            """
+            SELECT paragraph_hash, source, created_at, status, retry_count, last_error, updated_at
+            FROM episode_pending_paragraphs
+            WHERE status = 'pending'
+               OR (status = 'failed' AND retry_count < ?)
+            ORDER BY updated_at ASC
+            LIMIT ?
+            """,
+            (safe_retry, safe_limit),
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+    def mark_episode_pending_running(self, hashes: List[str]) -> None:
+        """批量标记队列项为 running。"""
+        if not hashes:
+            return
+        now = datetime.now().timestamp()
+        cursor = self._conn.cursor()
+        chunk_size = 500
+        uniq = list(dict.fromkeys([str(h).strip() for h in hashes if str(h).strip()]))
+        for i in range(0, len(uniq), chunk_size):
+            chunk = uniq[i:i + chunk_size]
+            placeholders = ",".join(["?"] * len(chunk))
+            cursor.execute(
+                f"""
+                UPDATE episode_pending_paragraphs
+                SET status = 'running', updated_at = ?
+                WHERE paragraph_hash IN ({placeholders})
+                  AND status IN ('pending', 'failed')
+                """,
+                [now] + chunk,
+            )
+        self._conn.commit()
+
+    def mark_episode_pending_done(self, hashes: List[str]) -> None:
+        """批量标记队列项为 done。"""
+        if not hashes:
+            return
+        now = datetime.now().timestamp()
+        cursor = self._conn.cursor()
+        chunk_size = 500
+        uniq = list(dict.fromkeys([str(h).strip() for h in hashes if str(h).strip()]))
+        for i in range(0, len(uniq), chunk_size):
+            chunk = uniq[i:i + chunk_size]
+            placeholders = ",".join(["?"] * len(chunk))
+            cursor.execute(
+                f"""
+                UPDATE episode_pending_paragraphs
+                SET status = 'done',
+                    last_error = NULL,
+                    updated_at = ?
+                WHERE paragraph_hash IN ({placeholders})
+                """,
+                [now] + chunk,
+            )
+        self._conn.commit()
+
+    def mark_episode_pending_failed(self, hash_value: str, error: str = "") -> None:
+        """标记单条队列项失败并累加重试次数。"""
+        token = str(hash_value or "").strip()
+        if not token:
+            return
+        now = datetime.now().timestamp()
+        cursor = self._conn.cursor()
+        cursor.execute(
+            """
+            UPDATE episode_pending_paragraphs
+            SET status = 'failed',
+                retry_count = COALESCE(retry_count, 0) + 1,
+                last_error = ?,
+                updated_at = ?
+            WHERE paragraph_hash = ?
+            """,
+            (str(error or ""), now, token),
+        )
+        self._conn.commit()
+
+    def _episode_row_to_dict(self, row: sqlite3.Row) -> Dict[str, Any]:
+        data = dict(row)
+
+        def _load_list(raw: Any) -> List[Any]:
+            if not raw:
+                return []
+            try:
+                val = json.loads(raw)
+                return val if isinstance(val, list) else []
+            except Exception:
+                return []
+
+        data["participants"] = _load_list(data.pop("participants_json", None))
+        data["keywords"] = _load_list(data.pop("keywords_json", None))
+        data["evidence_ids"] = _load_list(data.pop("evidence_ids_json", None))
+        return data
+
+    @staticmethod
+    def _as_optional_float(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except Exception:
+            return None
+
+    def upsert_episode(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """写入或更新 episode。"""
+        if not isinstance(payload, dict):
+            raise ValueError("payload 必须是字典")
+
+        title = str(payload.get("title", "") or "").strip()
+        summary = str(payload.get("summary", "") or "").strip()
+        if not title:
+            raise ValueError("episode.title 不能为空")
+        if not summary:
+            raise ValueError("episode.summary 不能为空")
+
+        source = str(payload.get("source", "") or "").strip() or None
+        participants_raw = payload.get("participants", []) or []
+        keywords_raw = payload.get("keywords", []) or []
+        evidence_ids_raw = payload.get("evidence_ids", []) or []
+        participants = [str(x).strip() for x in participants_raw if str(x).strip()]
+        keywords = [str(x).strip() for x in keywords_raw if str(x).strip()]
+        evidence_ids = [str(x).strip() for x in evidence_ids_raw if str(x).strip()]
+
+        now = datetime.now().timestamp()
+        created_at = self._as_optional_float(payload.get("created_at"))
+        updated_at = self._as_optional_float(payload.get("updated_at"))
+        created_ts = created_at if created_at is not None else now
+        updated_ts = updated_at if updated_at is not None else now
+
+        episode_id = str(payload.get("episode_id", "") or "").strip()
+        if not episode_id:
+            seed = json.dumps(
+                {
+                    "source": source,
+                    "title": title,
+                    "summary": summary,
+                    "event_time_start": payload.get("event_time_start"),
+                    "event_time_end": payload.get("event_time_end"),
+                    "evidence_ids": evidence_ids,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            episode_id = compute_hash(seed)
+
+        paragraph_count = payload.get("paragraph_count")
+        if paragraph_count is None:
+            paragraph_count = len(evidence_ids)
+        try:
+            paragraph_count = int(paragraph_count)
+        except Exception:
+            paragraph_count = len(evidence_ids)
+
+        time_conf = payload.get("time_confidence", 1.0)
+        llm_conf = payload.get("llm_confidence", 0.0)
+        try:
+            time_conf = float(time_conf)
+        except Exception:
+            time_conf = 1.0
+        try:
+            llm_conf = float(llm_conf)
+        except Exception:
+            llm_conf = 0.0
+
+        cursor = self._conn.cursor()
+        cursor.execute(
+            "SELECT created_at FROM episodes WHERE episode_id = ? LIMIT 1",
+            (episode_id,),
+        )
+        existed = cursor.fetchone()
+        if existed and existed[0] is not None:
+            created_ts = float(existed[0])
+
+        cursor.execute(
+            """
+            INSERT INTO episodes (
+                episode_id, source, title, summary,
+                event_time_start, event_time_end, time_granularity, time_confidence,
+                participants_json, keywords_json, evidence_ids_json,
+                paragraph_count, llm_confidence, segmentation_model, segmentation_version,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(episode_id) DO UPDATE SET
+                source = excluded.source,
+                title = excluded.title,
+                summary = excluded.summary,
+                event_time_start = excluded.event_time_start,
+                event_time_end = excluded.event_time_end,
+                time_granularity = excluded.time_granularity,
+                time_confidence = excluded.time_confidence,
+                participants_json = excluded.participants_json,
+                keywords_json = excluded.keywords_json,
+                evidence_ids_json = excluded.evidence_ids_json,
+                paragraph_count = excluded.paragraph_count,
+                llm_confidence = excluded.llm_confidence,
+                segmentation_model = excluded.segmentation_model,
+                segmentation_version = excluded.segmentation_version,
+                updated_at = excluded.updated_at
+            """,
+            (
+                episode_id,
+                source,
+                title,
+                summary,
+                self._as_optional_float(payload.get("event_time_start")),
+                self._as_optional_float(payload.get("event_time_end")),
+                str(payload.get("time_granularity", "") or "").strip() or None,
+                time_conf,
+                json.dumps(participants, ensure_ascii=False),
+                json.dumps(keywords, ensure_ascii=False),
+                json.dumps(evidence_ids, ensure_ascii=False),
+                max(0, paragraph_count),
+                llm_conf,
+                str(payload.get("segmentation_model", "") or "").strip() or None,
+                str(payload.get("segmentation_version", "") or "").strip() or None,
+                created_ts,
+                updated_ts,
+            ),
+        )
+        self._conn.commit()
+        return self.get_episode_by_id(episode_id) or {"episode_id": episode_id}
+
+    def bind_episode_paragraphs(self, episode_id: str, paragraph_hashes_ordered: List[str]) -> int:
+        """重建 episode 与段落映射。"""
+        token = str(episode_id or "").strip()
+        if not token:
+            raise ValueError("episode_id 不能为空")
+
+        normalized: List[str] = []
+        seen = set()
+        for item in paragraph_hashes_ordered or []:
+            h = str(item or "").strip()
+            if not h or h in seen:
+                continue
+            seen.add(h)
+            normalized.append(h)
+
+        cursor = self._conn.cursor()
+        cursor.execute("DELETE FROM episode_paragraphs WHERE episode_id = ?", (token,))
+
+        if normalized:
+            cursor.executemany(
+                """
+                INSERT OR IGNORE INTO episode_paragraphs (episode_id, paragraph_hash, position)
+                VALUES (?, ?, ?)
+                """,
+                [(token, h, idx) for idx, h in enumerate(normalized)],
+            )
+
+        now = datetime.now().timestamp()
+        cursor.execute(
+            """
+            UPDATE episodes
+            SET paragraph_count = ?, updated_at = ?
+            WHERE episode_id = ?
+            """,
+            (len(normalized), now, token),
+        )
+        self._conn.commit()
+        return len(normalized)
+
+    def _build_episode_query_components(
+        self,
+        *,
+        time_from: Optional[float] = None,
+        time_to: Optional[float] = None,
+        person: Optional[str] = None,
+        source: Optional[str] = None,
+    ) -> Tuple[str, str, str, List[str], List[Any]]:
+        source_expr = "TRIM(COALESCE(e.source, ''))"
+        effective_start = "COALESCE(e.event_time_start, e.event_time_end, e.updated_at)"
+        effective_end = "COALESCE(e.event_time_end, e.event_time_start, e.updated_at)"
+        conditions: List[str] = []
+        params: List[Any] = []
+
+        conditions.append(f"{source_expr} != ''")
+        conditions.append("COALESCE(e.paragraph_count, 0) > 0")
+        conditions.append(
+            """
+            NOT EXISTS (
+                SELECT 1
+                FROM episode_rebuild_sources ers
+                WHERE ers.source = TRIM(COALESCE(e.source, ''))
+                  AND ers.status IN ('pending', 'running', 'failed')
+            )
+            """
+        )
+
+        if source:
+            token = self._normalize_episode_source(source)
+            if not token:
+                return source_expr, effective_start, effective_end, ["1 = 0"], []
+            conditions.append(f"{source_expr} = ?")
+            params.append(token)
+
+        p = str(person or "").strip().lower()
+        if p:
+            like_person = f"%{p}%"
+            conditions.append(
+                """
+                (
+                    LOWER(COALESCE(e.participants_json, '')) LIKE ?
+                    OR EXISTS (
+                        SELECT 1
+                        FROM episode_paragraphs ep_person
+                        JOIN paragraph_entities pe ON pe.paragraph_hash = ep_person.paragraph_hash
+                        JOIN entities en ON en.hash = pe.entity_hash
+                        WHERE ep_person.episode_id = e.episode_id
+                          AND LOWER(en.name) LIKE ?
+                    )
+                )
+                """
+            )
+            params.extend([like_person, like_person])
+
+        if time_from is not None and time_to is not None:
+            conditions.append(f"({effective_end} >= ? AND {effective_start} <= ?)")
+            params.extend([float(time_from), float(time_to)])
+        elif time_from is not None:
+            conditions.append(f"({effective_end} >= ?)")
+            params.append(float(time_from))
+        elif time_to is not None:
+            conditions.append(f"({effective_start} <= ?)")
+            params.append(float(time_to))
+
+        return source_expr, effective_start, effective_end, conditions, params
+
+    def get_episode_rows_by_paragraph_hashes(
+        self,
+        paragraph_hashes: List[str],
+        *,
+        time_from: Optional[float] = None,
+        time_to: Optional[float] = None,
+        person: Optional[str] = None,
+        source: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        normalized: List[str] = []
+        seen = set()
+        for item in paragraph_hashes or []:
+            token = str(item or "").strip()
+            if not token or token in seen:
+                continue
+            seen.add(token)
+            normalized.append(token)
+        if not normalized:
+            return []
+
+        _, _, _, conditions, params = self._build_episode_query_components(
+            time_from=time_from,
+            time_to=time_to,
+            person=person,
+            source=source,
+        )
+        placeholders = ",".join(["?"] * len(normalized))
+        conditions.append(f"ep.paragraph_hash IN ({placeholders})")
+        conditions.append("(p.is_deleted IS NULL OR p.is_deleted = 0)")
+        where_sql = "WHERE " + " AND ".join(conditions)
+
+        sql = f"""
+            SELECT e.*, ep.paragraph_hash AS matched_paragraph_hash
+            FROM episodes e
+            JOIN episode_paragraphs ep ON ep.episode_id = e.episode_id
+            JOIN paragraphs p ON p.hash = ep.paragraph_hash
+            {where_sql}
+            ORDER BY e.updated_at DESC
+        """
+        cursor = self._conn.cursor()
+        cursor.execute(sql, tuple(params + normalized))
+
+        grouped: Dict[str, Dict[str, Any]] = {}
+        for row in cursor.fetchall():
+            episode_id = str(row["episode_id"] or "").strip()
+            if not episode_id:
+                continue
+            payload = grouped.get(episode_id)
+            if payload is None:
+                payload = self._episode_row_to_dict(row)
+                payload["matched_paragraph_hashes"] = []
+                grouped[episode_id] = payload
+            matched_hash = str(row["matched_paragraph_hash"] or "").strip()
+            if matched_hash and matched_hash not in payload["matched_paragraph_hashes"]:
+                payload["matched_paragraph_hashes"].append(matched_hash)
+
+        out = list(grouped.values())
+        for item in out:
+            item["matched_paragraph_count"] = len(item.get("matched_paragraph_hashes", []))
+        return out
+
+    def get_episode_rows_by_relation_hashes(
+        self,
+        relation_hashes: List[str],
+        *,
+        time_from: Optional[float] = None,
+        time_to: Optional[float] = None,
+        person: Optional[str] = None,
+        source: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        normalized: List[str] = []
+        seen = set()
+        for item in relation_hashes or []:
+            token = str(item or "").strip()
+            if not token or token in seen:
+                continue
+            seen.add(token)
+            normalized.append(token)
+        if not normalized:
+            return []
+
+        _, _, _, conditions, params = self._build_episode_query_components(
+            time_from=time_from,
+            time_to=time_to,
+            person=person,
+            source=source,
+        )
+        placeholders = ",".join(["?"] * len(normalized))
+        conditions.append(f"pr.relation_hash IN ({placeholders})")
+        conditions.append("(p.is_deleted IS NULL OR p.is_deleted = 0)")
+        where_sql = "WHERE " + " AND ".join(conditions)
+
+        sql = f"""
+            SELECT
+                e.*,
+                p.hash AS matched_paragraph_hash,
+                pr.relation_hash AS matched_relation_hash
+            FROM episodes e
+            JOIN episode_paragraphs ep ON ep.episode_id = e.episode_id
+            JOIN paragraphs p ON p.hash = ep.paragraph_hash
+            JOIN paragraph_relations pr ON pr.paragraph_hash = p.hash
+            {where_sql}
+            ORDER BY e.updated_at DESC
+        """
+        cursor = self._conn.cursor()
+        cursor.execute(sql, tuple(params + normalized))
+
+        grouped: Dict[str, Dict[str, Any]] = {}
+        for row in cursor.fetchall():
+            episode_id = str(row["episode_id"] or "").strip()
+            if not episode_id:
+                continue
+            payload = grouped.get(episode_id)
+            if payload is None:
+                payload = self._episode_row_to_dict(row)
+                payload["matched_paragraph_hashes"] = []
+                payload["matched_relation_hashes"] = []
+                grouped[episode_id] = payload
+            matched_paragraph = str(row["matched_paragraph_hash"] or "").strip()
+            matched_relation = str(row["matched_relation_hash"] or "").strip()
+            if matched_paragraph and matched_paragraph not in payload["matched_paragraph_hashes"]:
+                payload["matched_paragraph_hashes"].append(matched_paragraph)
+            if matched_relation and matched_relation not in payload["matched_relation_hashes"]:
+                payload["matched_relation_hashes"].append(matched_relation)
+
+        out = list(grouped.values())
+        for item in out:
+            item["matched_paragraph_count"] = len(item.get("matched_paragraph_hashes", []))
+            item["matched_relation_count"] = len(item.get("matched_relation_hashes", []))
+        return out
+
+    def query_episodes(
+        self,
+        query: str = "",
+        time_from: Optional[float] = None,
+        time_to: Optional[float] = None,
+        person: Optional[str] = None,
+        source: Optional[str] = None,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """查询 episode 列表。"""
+        safe_limit = max(1, int(limit))
+        _, effective_start, effective_end, conditions, params = self._build_episode_query_components(
+            time_from=time_from,
+            time_to=time_to,
+            person=person,
+            source=source,
+        )
+
+        q = str(query or "").strip().lower()
+        select_score_sql = "0.0 AS lexical_score"
+        order_sql = f"{effective_end} DESC, e.updated_at DESC"
+        select_params: List[Any] = []
+        query_params: List[Any] = []
+        if q:
+            like = f"%{q}%"
+            title_expr = "LOWER(COALESCE(e.title, '')) LIKE ?"
+            summary_expr = "LOWER(COALESCE(e.summary, '')) LIKE ?"
+            keywords_expr = "LOWER(COALESCE(e.keywords_json, '')) LIKE ?"
+            participants_expr = "LOWER(COALESCE(e.participants_json, '')) LIKE ?"
+            conditions.append(
+                f"({title_expr} OR {summary_expr} OR {keywords_expr} OR {participants_expr})"
+            )
+            select_score_sql = (
+                f"(CASE WHEN {title_expr} THEN 4.0 ELSE 0.0 END + "
+                f"CASE WHEN {keywords_expr} THEN 3.0 ELSE 0.0 END + "
+                f"CASE WHEN {summary_expr} THEN 2.0 ELSE 0.0 END + "
+                f"CASE WHEN {participants_expr} THEN 1.0 ELSE 0.0 END) AS lexical_score"
+            )
+            select_params.extend([like, like, like, like])
+            query_params.extend([like, like, like, like])
+            order_sql = f"lexical_score DESC, {effective_end} DESC, e.updated_at DESC"
+
+        where_sql = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+        sql = f"""
+            SELECT e.*, {select_score_sql}
+            FROM episodes e
+            {where_sql}
+            ORDER BY {order_sql}
+            LIMIT ?
+        """
+        final_params = list(select_params) + list(params) + list(query_params) + [safe_limit]
+
+        cursor = self._conn.cursor()
+        cursor.execute(sql, tuple(final_params))
+        return [self._episode_row_to_dict(row) for row in cursor.fetchall()]
+
+    def get_episode_by_id(self, episode_id: str) -> Optional[Dict[str, Any]]:
+        """获取单条 episode。"""
+        token = str(episode_id or "").strip()
+        if not token:
+            return None
+        cursor = self._conn.cursor()
+        cursor.execute(
+            "SELECT * FROM episodes WHERE episode_id = ? LIMIT 1",
+            (token,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        return self._episode_row_to_dict(row)
+
+    def get_episode_paragraphs(self, episode_id: str, limit: int = 100) -> List[Dict[str, Any]]:
+        """获取 episode 关联段落（按 position 排序）。"""
+        token = str(episode_id or "").strip()
+        if not token:
+            return []
+        safe_limit = max(1, int(limit))
+        cursor = self._conn.cursor()
+        cursor.execute(
+            """
+            SELECT p.*, ep.position
+            FROM episode_paragraphs ep
+            JOIN paragraphs p ON p.hash = ep.paragraph_hash
+            WHERE ep.episode_id = ?
+              AND (p.is_deleted IS NULL OR p.is_deleted = 0)
+            ORDER BY ep.position ASC
+            LIMIT ?
+            """,
+            (token, safe_limit),
+        )
+        items = []
+        for row in cursor.fetchall():
+            payload = self._row_to_dict(row, "paragraph")
+            payload["position"] = row["position"]
+            items.append(payload)
+        return items
 
     def has_table(self, table_name: str) -> bool:
         """检查数据库是否存在指定表。"""

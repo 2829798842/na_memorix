@@ -28,6 +28,19 @@ plugin_root = current_dir.parent
 project_root = plugin_root.parent.parent
 sys.path.insert(0, str(project_root))
 
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="A_Memorix 知识库批量删除工具")
+    parser.add_argument("--list", action="store_true", help="列出所有知识来源文件")
+    parser.add_argument("--source", type=str, help="指定要删除的来源名称 (文件名)")
+    parser.add_argument("--yes", "-y", action="store_true", help="跳过确认提示")
+    return parser
+
+
+# --help/-h fast path: avoid heavy host/plugin bootstrap
+if any(arg in {"-h", "--help"} for arg in sys.argv[1:]):
+    _build_arg_parser().print_help()
+    sys.exit(0)
+
 try:
     import src
     import plugins
@@ -91,27 +104,10 @@ class KnowledgeDeleter:
 
     def _is_entity_still_referenced(self, entity_hash: str, entity_name: str) -> bool:
         """判断实体是否仍被任何有效数据引用。"""
-        # 1) 段落实体关联仍存在
-        if self.metadata_store.query(
-            "SELECT 1 FROM paragraph_entities WHERE entity_hash = ? LIMIT 1",
-            (entity_hash,),
-        ):
+        if self.metadata_store and self.metadata_store.is_entity_still_referenced(entity_hash, entity_name):
             return True
 
-        # 2) 关系仍引用 (subject/object) - 使用大小写不敏感匹配
-        canon_name = str(entity_name).strip().lower()
-        if canon_name and self.metadata_store.query(
-            """
-            SELECT 1
-            FROM relations
-            WHERE LOWER(TRIM(subject)) = ? OR LOWER(TRIM(object)) = ?
-            LIMIT 1
-            """,
-            (canon_name, canon_name),
-        ):
-            return True
-
-        # 3) 图中仍有邻居
+        # 图中仍有邻居（双重确认，避免孤儿实体误删）
         try:
             if self.graph_store.get_neighbors(entity_name):
                 return True
@@ -224,7 +220,7 @@ class KnowledgeDeleter:
             errors = []
             candidate_entities = {}
             relation_prune_ops = []
-            fallback_edges = set()
+            unresolved_edge_cleanup = 0
             
             for p in paragraphs:
                 try:
@@ -246,8 +242,8 @@ class KnowledgeDeleter:
                     for op in cleanup_plan.get("relation_prune_ops", []):
                         relation_prune_ops.append(op)
 
-                    for edge in cleanup_plan.get("edges_to_remove", []):
-                        fallback_edges.add(tuple(edge))
+                    if cleanup_plan.get("edges_to_remove") and not cleanup_plan.get("relation_prune_ops"):
+                        unresolved_edge_cleanup += len(cleanup_plan.get("edges_to_remove", []))
                             
                     deleted_count += 1
                 except Exception as e:
@@ -257,10 +253,12 @@ class KnowledgeDeleter:
             try:
                 if relation_prune_ops and hasattr(self.graph_store, "prune_relation_hashes"):
                     self.graph_store.prune_relation_hashes(relation_prune_ops)
-                elif fallback_edges:
-                    self.graph_store.delete_edges(list(fallback_edges))
             except Exception:
                 pass
+            if unresolved_edge_cleanup > 0:
+                errors.append(
+                    "graph_cleanup_unresolved: edge hash map missing; run scripts/release_vnext_migrate.py migrate"
+                )
 
             # 保守清理孤儿实体
             removed_entities, skipped_entities = self._cleanup_orphan_entities(candidate_entities)
@@ -282,11 +280,7 @@ class KnowledgeDeleter:
             self.metadata_store.close()
 
 def main():
-    parser = argparse.ArgumentParser(description="A_Memorix 知识库批量删除工具")
-    parser.add_argument("--list", action="store_true", help="列出所有知识来源文件")
-    parser.add_argument("--source", type=str, help="指定要删除的来源名称 (文件名)")
-    parser.add_argument("--yes", "-y", action="store_true", help="跳过确认提示")
-    
+    parser = _build_arg_parser()
     args = parser.parse_args()
     
     deleter = KnowledgeDeleter()

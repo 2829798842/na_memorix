@@ -14,15 +14,9 @@ from src.chat.message_receive.chat_stream import ChatStream
 # 导入核心模块
 from ...core import (
     DualPathRetriever,
-    RetrievalStrategy,
-    DualPathRetrieverConfig,
     DynamicThresholdFilter,
-    ThresholdConfig,
-    ThresholdMethod,
-    SparseBM25Config,
-    FusionConfig,
-    RelationIntentConfig,
 )
+from ...core.runtime import build_search_runtime
 from ...core.utils.search_execution_service import (
     SearchExecutionRequest,
     SearchExecutionService,
@@ -124,110 +118,14 @@ class KnowledgeSearchAction(BaseAction):
  
     def _initialize_retriever(self) -> None:
         """初始化检索器"""
-        try:
-            # 从插件配置获取存储实例 (优先从配置获取，兜底从插件实例获取)
-            vector_store = self.plugin_config.get("vector_store")
-            graph_store = self.plugin_config.get("graph_store")
-            metadata_store = self.plugin_config.get("metadata_store")
-            embedding_manager = self.plugin_config.get("embedding_manager")
-            sparse_index = self.plugin_config.get("sparse_index")
-
-            # 兜底逻辑：如果配置中没有存储实例，尝试直接从插件系统获取
-            # 使用 is not None 检查，因为空对象可能布尔值为 False
-            if not all([
-                vector_store is not None,
-                graph_store is not None,
-                metadata_store is not None,
-                embedding_manager is not None
-            ]):
-                from ...plugin import A_MemorixPlugin
-                instances = A_MemorixPlugin.get_storage_instances()
-                if instances:
-                    vector_store = vector_store or instances.get("vector_store")
-                    graph_store = graph_store or instances.get("graph_store")
-                    metadata_store = metadata_store or instances.get("metadata_store")
-                    embedding_manager = embedding_manager or instances.get("embedding_manager")
-                    sparse_index = sparse_index or instances.get("sparse_index")
-
-
-            # 最终检查 (使用 is not None 而非布尔值，因为空对象可能为 False)
-            if not all([
-                vector_store is not None,
-                graph_store is not None,
-                metadata_store is not None,
-                embedding_manager is not None
-            ]):
-                logger.warning(f"{self.log_prefix} 存储组件未完全初始化，无法使用检索功能")
-                return
-
-            # 创建检索器配置
-            sparse_cfg_raw = self.get_config("retrieval.sparse", {}) or {}
-            if not isinstance(sparse_cfg_raw, dict):
-                sparse_cfg_raw = {}
-            fusion_cfg_raw = self.get_config("retrieval.fusion", {}) or {}
-            if not isinstance(fusion_cfg_raw, dict):
-                fusion_cfg_raw = {}
-            relation_intent_cfg_raw = self.get_config("retrieval.search.relation_intent", {}) or {}
-            if not isinstance(relation_intent_cfg_raw, dict):
-                relation_intent_cfg_raw = {}
-            try:
-                sparse_cfg = SparseBM25Config(**sparse_cfg_raw)
-            except Exception as e:
-                logger.warning(f"{self.log_prefix} sparse 配置非法，回退默认: {e}")
-                sparse_cfg = SparseBM25Config()
-            try:
-                fusion_cfg = FusionConfig(**fusion_cfg_raw)
-            except Exception as e:
-                logger.warning(f"{self.log_prefix} fusion 配置非法，回退默认: {e}")
-                fusion_cfg = FusionConfig()
-            try:
-                relation_intent_cfg = RelationIntentConfig(**relation_intent_cfg_raw)
-            except Exception as e:
-                logger.warning(f"{self.log_prefix} relation_intent 配置非法，回退默认: {e}")
-                relation_intent_cfg = RelationIntentConfig()
-
-            config = DualPathRetrieverConfig(
-                top_k_paragraphs=self.get_config("retrieval.top_k_paragraphs", 20),
-                top_k_relations=self.get_config("retrieval.top_k_relations", 10),
-                top_k_final=self.get_config("retrieval.top_k_final", 10),
-                alpha=self.get_config("retrieval.alpha", 0.5),
-                enable_ppr=self.get_config("retrieval.enable_ppr", True),
-                ppr_alpha=self.get_config("retrieval.ppr_alpha", 0.85),
-                ppr_concurrency_limit=self.get_config("retrieval.ppr_concurrency_limit", 4),
-                enable_parallel=self.get_config("retrieval.enable_parallel", True),
-                retrieval_strategy=RetrievalStrategy.DUAL_PATH,
-                debug=self.debug_enabled,
-                sparse=sparse_cfg,
-                fusion=fusion_cfg,
-                relation_intent=relation_intent_cfg,
-            )
-
-            # 创建检索器
-            self.retriever = DualPathRetriever(
-                vector_store=vector_store,
-                graph_store=graph_store,
-                metadata_store=metadata_store,
-                embedding_manager=embedding_manager,
-                sparse_index=sparse_index,
-                config=config,
-            )
-
-            threshold_config = ThresholdConfig(
-                method=ThresholdMethod.ADAPTIVE,
-                min_threshold=self.get_config("threshold.min_threshold", 0.3),
-                max_threshold=self.get_config("threshold.max_threshold", 0.95),
-                percentile=self.get_config("threshold.percentile", 75.0),
-                std_multiplier=self.get_config("threshold.std_multiplier", 1.5),
-                min_results=self.get_config("threshold.min_results", 3),
-                enable_auto_adjust=self.get_config("threshold.enable_auto_adjust", True),
-            )
-            self.threshold_filter = DynamicThresholdFilter(threshold_config)
-
-            logger.info(f"{self.log_prefix} 知识检索器初始化完成")
-
-        except Exception as e:
-            logger.error(f"{self.log_prefix} 检索器初始化失败: {e}")
-            self.retriever = None
+        runtime = build_search_runtime(
+            plugin_config=self.plugin_config,
+            logger_obj=logger,
+            owner_tag="action",
+            log_prefix=self.log_prefix,
+        )
+        self.retriever = runtime.retriever
+        self.threshold_filter = runtime.threshold_filter
 
     async def execute(self) -> Tuple[bool, str]:
         """执行知识检索

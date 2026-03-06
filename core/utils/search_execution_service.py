@@ -388,7 +388,11 @@ class SearchExecutionService:
 
         dedup_hit = False
         try:
+            # 调优评估需要逐轮真实执行，且应避免额外 dedup 锁竞争。
+            bypass_request_dedup = str(request.caller or "").strip().lower() == "retrieval_tuning"
             if (
+                not bypass_request_dedup
+                and
                 plugin_instance is not None
                 and hasattr(plugin_instance, "execute_request_with_dedup")
             ):

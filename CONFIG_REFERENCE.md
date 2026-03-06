@@ -1,6 +1,6 @@
 # A_Memorix 配置参数详解（config.toml）
 
-适用版本：`plugins/A_memorix/config.toml`（`config_version = "4.1.0"`，插件代码 `v0.7.0`）。
+适用版本：`plugins/A_memorix/config.toml`（`config_version = "4.1.0"`，插件代码 `v1.0.0`）。
 
 ---
 
@@ -403,7 +403,8 @@
   - 生效：构造总结 prompt 时决定是否拼接 personality 文本。
 - `summarization.default_knowledge_type`
   - 功能：总结入库时默认知识类型。
-  - 生效：写入段落时转换为 `KnowledgeType`（无法识别时回退 `narrative`）。
+  - 允许值：`narrative`、`factual`、`quote`、`structured`、`mixed`。
+  - 生效：写入段落时转换为合法落库 `KnowledgeType`。
 
 ## `[schedule]` 定时任务
 

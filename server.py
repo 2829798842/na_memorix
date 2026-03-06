@@ -2,6 +2,7 @@
 import asyncio
 import threading
 import json
+from contextlib import asynccontextmanager
 import uvicorn
 from fastapi import FastAPI, HTTPException, Body, Query, UploadFile, File, Form, Header
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,7 +14,17 @@ from pydantic import BaseModel
 
 from src.common.logger import get_logger
 from src.common.database.database_model import PersonInfo
+from .core.runtime import build_search_runtime
+from .core.utils.aggregate_query_service import AggregateQueryService
+from .core.utils.episode_retrieval_service import EpisodeRetrievalService
 from .core.utils.hash import compute_hash
+from .core.utils.runtime_self_check import ensure_runtime_self_check
+from .core.utils.search_execution_service import (
+    SearchExecutionRequest,
+    SearchExecutionService,
+)
+from .core.utils.time_parser import parse_query_time_range
+from .core.utils.retrieval_tuning_manager import RetrievalTuningManager
 
 logger = get_logger("A_Memorix.Server")
 
@@ -169,12 +180,74 @@ class ImportMaiBotMigrationRequest(BaseModel):
     dry_run: Optional[bool] = None
     verify_only: Optional[bool] = None
 
+class EpisodeQueryRequest(BaseModel):
+    query: Optional[str] = None
+    top_k: Optional[int] = 5
+    time_from: Optional[str] = None
+    time_to: Optional[str] = None
+    person: Optional[str] = None
+    source: Optional[str] = None
+    include_paragraphs: Optional[bool] = False
+
+
+class EpisodeRebuildRequest(BaseModel):
+    scope: str = "source"
+    source: Optional[str] = None
+
+
+class AggregateQueryRequest(BaseModel):
+    query: Optional[str] = None
+    top_k: Optional[int] = None
+    mix: Optional[bool] = False
+    mix_top_k: Optional[int] = None
+    time_from: Optional[str] = None
+    time_to: Optional[str] = None
+    person: Optional[str] = None
+    source: Optional[str] = None
+    include_paragraphs: Optional[bool] = False
+    use_threshold: Optional[bool] = True
+
+
+class RetrievalTuningProfileApplyRequest(BaseModel):
+    profile: Dict[str, Any]
+    reason: Optional[str] = None
+
+
+class RetrievalTuningTaskCreateRequest(BaseModel):
+    objective: Optional[str] = "precision_priority"
+    intensity: Optional[str] = "standard"
+    rounds: Optional[int] = None
+    sample_size: Optional[int] = None
+    top_k_eval: Optional[int] = None
+    eval_query_timeout_seconds: Optional[float] = None
+    llm_enabled: Optional[bool] = True
+    seed: Optional[int] = None
+
 class MemorixServer:
     def __init__(self, plugin_instance, host="0.0.0.0", port=8082):
         self.plugin = plugin_instance
         self.host = host
         self.port = port
-        self.app = FastAPI(title="A_Memorix 可视化编辑器")
+        self.import_manager = None
+        self.tuning_manager = None
+
+        @asynccontextmanager
+        async def _lifespan(_: FastAPI):
+            try:
+                yield
+            finally:
+                if self.import_manager is not None:
+                    try:
+                        await self.import_manager.shutdown()
+                    except Exception as e:
+                        logger.warning(f"Import manager shutdown failed: {e}")
+                if self.tuning_manager is not None:
+                    try:
+                        await self.tuning_manager.shutdown()
+                    except Exception as e:
+                        logger.warning(f"Retrieval tuning manager shutdown failed: {e}")
+
+        self.app = FastAPI(title="A_Memorix 可视化编辑器", lifespan=_lifespan)
         self.server_thread = None
         self._server = None
         self.should_exit = False
@@ -184,22 +257,22 @@ class MemorixServer:
         self._relation_cache_timestamp = 0
         self._relation_cache_snapshot = None
 
-        # 兜底：确保核心存储在 Web 服务启动前可用（例如 debug_server 直启场景）
-        if any(
-            getattr(self.plugin, attr, None) is None
-            for attr in ("metadata_store", "vector_store", "graph_store", "embedding_manager")
-        ):
-            sync_init = getattr(self.plugin, "_sync_initialize", None)
-            if callable(sync_init):
-                try:
-                    sync_init()
-                except Exception as e:
-                    logger.warning(f"MemorixServer pre-init storage failed: {e}")
+        # readiness 仅检查，不做懒初始化兜底
+        ready_checker = getattr(self.plugin, "is_runtime_ready", None)
+        if callable(ready_checker) and not ready_checker():
+            logger.warning("MemorixServer started while plugin runtime not ready; write routes may return 503")
 
         # 导入任务管理器
         from .core.utils.web_import_manager import ImportTaskManager
         self.import_manager = ImportTaskManager(plugin_instance)
         self.import_manager.set_write_changed_callback(self._on_import_write_changed)
+
+        self.tuning_manager = RetrievalTuningManager(
+            plugin_instance,
+            import_write_blocked_provider=lambda: bool(
+                self.import_manager and self.import_manager.is_write_blocked()
+            ),
+        )
         
         # 配置 CORS
         self.app.add_middleware(
@@ -258,6 +331,9 @@ class MemorixServer:
         def _is_import_enabled() -> bool:
             return bool(self.plugin.get_config("web.import.enabled", True))
 
+        def _is_tuning_enabled() -> bool:
+            return bool(self.plugin.get_config("web.tuning.enabled", True))
+
         def _ensure_write_allowed() -> None:
             if self.import_manager and self.import_manager.is_write_blocked():
                 raise HTTPException(
@@ -278,25 +354,7 @@ class MemorixServer:
             if not self.plugin.metadata_store:
                 return (0, 0.0, "")
             try:
-                rows = self.plugin.metadata_store.query(
-                    """
-                    SELECT
-                        COUNT(*) AS relation_count,
-                        COALESCE(MAX(created_at), 0) AS max_created_at,
-                        COALESCE(MAX(hash), '') AS max_hash
-                    FROM relations
-                    """
-                )
-                if not rows:
-                    return (0, 0.0, "")
-                row = rows[0]
-                if isinstance(row, dict):
-                    return (
-                        int(row.get("relation_count") or 0),
-                        float(row.get("max_created_at") or 0.0),
-                        str(row.get("max_hash") or ""),
-                    )
-                return (int(row[0] or 0), float(row[1] or 0.0), str(row[2] or ""))
+                return self.plugin.metadata_store.get_relation_db_snapshot()
             except Exception as e:
                 logger.warning(f"Failed to read relation snapshot: {e}")
                 return (0, 0.0, "")
@@ -404,23 +462,7 @@ class MemorixServer:
         def _is_entity_still_referenced(entity_hash: str, entity_name: str) -> bool:
             if not self.plugin.metadata_store:
                 return False
-
-            if self.plugin.metadata_store.query(
-                "SELECT 1 FROM paragraph_entities WHERE entity_hash = ? LIMIT 1",
-                (entity_hash,),
-            ):
-                return True
-
-            canon_name = str(entity_name or "").strip().lower()
-            if canon_name and self.plugin.metadata_store.query(
-                """
-                SELECT 1
-                FROM relations
-                WHERE LOWER(TRIM(subject)) = ? OR LOWER(TRIM(object)) = ?
-                LIMIT 1
-                """,
-                (canon_name, canon_name),
-            ):
+            if self.plugin.metadata_store.is_entity_still_referenced(entity_hash, entity_name):
                 return True
 
             if self.plugin.graph_store:
@@ -474,14 +516,45 @@ class MemorixServer:
 
             return removed, skipped
 
-        @self.app.on_event("shutdown")
-        async def _on_shutdown():
-            try:
-                await self.import_manager.shutdown()
-            except Exception as e:
-                logger.warning(f"Import manager shutdown failed: {e}")
 
-        
+        self._register_graph_routes(
+            _ensure_write_allowed=_ensure_write_allowed,
+            _relation_db_snapshot=_relation_db_snapshot,
+            _fallback_predicates_for_edge=_fallback_predicates_for_edge,
+        )
+        self._register_source_routes(
+            _ensure_write_allowed=_ensure_write_allowed,
+            _cleanup_manifest_for_sources=_cleanup_manifest_for_sources,
+            _collect_paragraph_entities=_collect_paragraph_entities,
+            _cleanup_orphan_entities=_cleanup_orphan_entities,
+        )
+        self._register_query_routes()
+        self._register_episode_routes(_ensure_write_allowed=_ensure_write_allowed)
+        self._register_memory_routes(_ensure_write_allowed=_ensure_write_allowed)
+        self._register_person_profile_routes(
+            _ensure_write_allowed=_ensure_write_allowed,
+            _build_person_profile_service=_build_person_profile_service,
+            _resolve_person_id_for_web=_resolve_person_id_for_web,
+            _parse_group_nicks=_parse_group_nicks,
+        )
+        self._register_admin_routes(_ensure_write_allowed=_ensure_write_allowed)
+        self._register_import_routes(
+            _is_import_enabled=_is_import_enabled,
+            _ensure_import_token=_ensure_import_token,
+            _load_import_guide_text=_load_import_guide_text,
+        )
+        self._register_retrieval_tuning_routes(_is_tuning_enabled=_is_tuning_enabled)
+        self._register_page_routes(
+            _is_import_enabled=_is_import_enabled,
+            _is_tuning_enabled=_is_tuning_enabled,
+        )
+
+    def _register_graph_routes(
+        self,
+        _ensure_write_allowed,
+        _relation_db_snapshot,
+        _fallback_predicates_for_edge,
+    ):
         @self.app.get("/api/graph")
         async def get_graph(exclude_leaf: bool = False, source: Optional[str] = None, density: float = 1.0):
             """获取图谱数据，支持过滤叶子节点、来源及信息密度控制"""
@@ -732,39 +805,32 @@ class MemorixServer:
             # 遍历持久化存储中的所有边，找出虽然权重为 0（非活跃）但连接着两个可见节点的边
             if self.plugin.graph_store:
                 gst = self.plugin.graph_store
-                idx_to_node = gst._nodes
-                
                 # O(E) 遍历 - 对于可视化端点是可以接受的
-                for (s_idx, t_idx), hashes in gst._edge_hash_map.items():
-                    if not hashes: continue
-                    
-                    # 确保索引有效
-                    if s_idx < len(idx_to_node) and t_idx < len(idx_to_node):
-                        s_name = idx_to_node[s_idx]
-                        t_name = idx_to_node[t_idx]
-                        
-                        # 仅当两个节点都在当前过滤视图中时显示
-                        if s_name in filtered_node_set and t_name in filtered_node_set:
-                            edge_key = (s_name, t_name)
-                            if edge_key not in processed_edges:
-                                # 找到一条非活跃边
-                                predicates = edge_predicates.get(edge_key, [])
-                                display_label = ", ".join(predicates[:3]) if predicates else "(冷冻)"
-                                
-                                edges.append({
-                                    "id": f"{s_name}_{t_name}",
-                                    "from": s_name, 
-                                    "to": t_name, 
-                                    "value": 0.05, # 最小视觉权重
-                                    "physics": False, # 不影响布局
-                                    "label": display_label,
-                                    "predicates": predicates,
-                                    "arrows": "to",
-                                    "is_active": False,
-                                    "dashes": True, # 视觉提示
-                                    "color": {"color": "rgba(203, 213, 225, 0.4)"} # 默认 Slate-300
-                                })
-                                processed_edges.add(edge_key)
+                for s_name, t_name, hashes in gst.iter_edge_hash_entries():
+                    if not hashes:
+                        continue
+                    # 仅当两个节点都在当前过滤视图中时显示
+                    if s_name in filtered_node_set and t_name in filtered_node_set:
+                        edge_key = (s_name, t_name)
+                        if edge_key not in processed_edges:
+                            # 找到一条非活跃边
+                            predicates = edge_predicates.get(edge_key, [])
+                            display_label = ", ".join(predicates[:3]) if predicates else "(冷冻)"
+
+                            edges.append({
+                                "id": f"{s_name}_{t_name}",
+                                "from": s_name,
+                                "to": t_name,
+                                "value": 0.05, # 最小视觉权重
+                                "physics": False, # 不影响布局
+                                "label": display_label,
+                                "predicates": predicates,
+                                "arrows": "to",
+                                "is_active": False,
+                                "dashes": True, # 视觉提示
+                                "color": {"color": "rgba(203, 213, 225, 0.4)"} # 默认 Slate-300
+                            })
+                            processed_edges.add(edge_key)
             
             # --- V5: 注入节点状态 (软删除) ---
             if self.plugin.metadata_store and nodes:
@@ -830,9 +896,6 @@ class MemorixServer:
                     # MetadataStore.get_relation_status_batch 接收 [hashes]。
                     # 但这里我们只有边 (s,t)。我们需要先将 (s,t) 映射到哈希。
                     
-                    # GraphStore 拥有 `_edge_hash_map`。
-                    # 让我们遍历边并收集哈希。
-                    
                     all_graph_hashes = []
                     edge_hash_mapping = {} # 边索引 -> [hashes]
                     
@@ -840,19 +903,11 @@ class MemorixServer:
                     
                     for i, edge in enumerate(edges):
                         s, t = edge['from'], edge['to']
-                        # 从 GraphStore 映射中获取哈希
-                        # 使用内部方法还是需要公开 API？
-                        # _edge_hash_map 使用索引。
-                        s_canon = gst._canonicalize(s)
-                        t_canon = gst._canonicalize(t)
-                        if s_canon in gst._node_to_idx and t_canon in gst._node_to_idx:
-                            s_idx = gst._node_to_idx[s_canon]
-                            t_idx = gst._node_to_idx[t_canon]
-                            hashes = gst._edge_hash_map.get((s_idx, t_idx), set())
-                            if hashes:
-                                h_list = list(hashes)
-                                all_graph_hashes.extend(h_list)
-                                edge_hash_mapping[i] = h_list
+                        hashes = gst.get_relation_hashes_for_edge(s, t)
+                        if hashes:
+                            h_list = list(hashes)
+                            all_graph_hashes.extend(h_list)
+                            edge_hash_mapping[i] = h_list
  
                     if all_graph_hashes:
                         # 批量查询元数据
@@ -1114,6 +1169,14 @@ class MemorixServer:
                 logger.error(f"Rename node failed: {e}")
                 raise HTTPException(status_code=500, detail=str(e))
 
+
+    def _register_source_routes(
+        self,
+        _ensure_write_allowed,
+        _cleanup_manifest_for_sources,
+        _collect_paragraph_entities,
+        _cleanup_orphan_entities,
+    ):
         @self.app.post("/api/source/list")
         async def list_sources(data: SourceListRequest):
             """获取来源段落列表"""
@@ -1196,7 +1259,7 @@ class MemorixServer:
                 errors = []
                 candidate_entities: Dict[str, str] = {}
                 relation_prune_ops: List[tuple[str, str, str]] = []
-                fallback_edges = set()
+                unresolved_edge_cleanup = 0
                 
                 # 2. 逐个删除 (复用原子删除逻辑)
                 # 考虑到性能，这里是简单的循环。如果有成千上万条，可能需要优化为批量事务。
@@ -1218,8 +1281,8 @@ class MemorixServer:
                         for op in cleanup_plan.get("relation_prune_ops", []):
                             relation_prune_ops.append(op)
 
-                        for edge in cleanup_plan.get("edges_to_remove", []):
-                            fallback_edges.add(tuple(edge))
+                        if cleanup_plan.get("edges_to_remove") and not cleanup_plan.get("relation_prune_ops"):
+                            unresolved_edge_cleanup += len(cleanup_plan.get("edges_to_remove", []))
                                 
                         deleted_count += 1
                         
@@ -1231,11 +1294,13 @@ class MemorixServer:
                 try:
                     if relation_prune_ops and hasattr(self.plugin.graph_store, "prune_relation_hashes"):
                         self.plugin.graph_store.prune_relation_hashes(relation_prune_ops)
-                    elif fallback_edges:
-                        self.plugin.graph_store.delete_edges(list(fallback_edges))
                 except Exception as ge:
                     logger.error(f"Batch graph cleanup failed: {ge}")
                     errors.append(f"graph_cleanup: {ge}")
+                if unresolved_edge_cleanup > 0:
+                    errors.append(
+                        "graph_cleanup_unresolved: edge hash map missing; run scripts/release_vnext_migrate.py migrate"
+                    )
 
                 # 2.2 孤儿实体清理：避免批删后残留无引用节点。
                 removed_entities, skipped_entities = _cleanup_orphan_entities(candidate_entities)
@@ -1305,19 +1370,16 @@ class MemorixServer:
                         
                 # 2. 清理图边 (批量删除)
                 relation_prune_ops = cleanup_plan.get("relation_prune_ops", []) or []
-                edges_to_remove = cleanup_plan.get("edges_to_remove", [])
                 if relation_prune_ops:
                     try:
                         self.plugin.graph_store.prune_relation_hashes(relation_prune_ops)
                     except Exception as ge:
                         logger.error(f"Graph cleanup failed: {ge}")
                         errors.append(f"Graph cleanup error: {ge}")
-                elif edges_to_remove:
-                    try:
-                        self.plugin.graph_store.delete_edges(edges_to_remove)
-                    except Exception as ge:
-                        logger.error(f"Graph cleanup failed: {ge}")
-                        errors.append(f"Graph cleanup error: {ge}")
+                elif cleanup_plan.get("edges_to_remove"):
+                    errors.append(
+                        "Graph cleanup skipped: relation hash map missing; run scripts/release_vnext_migrate.py migrate"
+                    )
 
                 removed_entities, skipped_entities = _cleanup_orphan_entities(candidate_entities)
                 
@@ -1382,6 +1444,484 @@ class MemorixServer:
                 logger.error(f"Delete source failed: {e}")
                 raise HTTPException(status_code=500, detail=str(e))
 
+
+    def _register_query_routes(self):
+        def _build_runtime_config() -> Dict[str, Any]:
+            base = dict(getattr(self.plugin, "config", {}) or {})
+            base["vector_store"] = getattr(self.plugin, "vector_store", None)
+            base["graph_store"] = getattr(self.plugin, "graph_store", None)
+            base["metadata_store"] = getattr(self.plugin, "metadata_store", None)
+            base["embedding_manager"] = getattr(self.plugin, "embedding_manager", None)
+            base["sparse_index"] = getattr(self.plugin, "sparse_index", None)
+            base["plugin_instance"] = self.plugin
+            return base
+
+        def _serialize_episode(row: Dict[str, Any]) -> Dict[str, Any]:
+            return {
+                "type": "episode",
+                "episode_id": str(row.get("episode_id", "") or ""),
+                "source": str(row.get("source", "") or ""),
+                "title": str(row.get("title", "") or ""),
+                "summary": str(row.get("summary", "") or ""),
+                "time_meta": {
+                    "event_time_start": row.get("event_time_start"),
+                    "event_time_end": row.get("event_time_end"),
+                    "time_granularity": row.get("time_granularity"),
+                    "time_confidence": row.get("time_confidence"),
+                },
+                "participants": list(row.get("participants", []) or []),
+                "keywords": list(row.get("keywords", []) or []),
+                "evidence_ids": list(row.get("evidence_ids", []) or []),
+                "paragraph_count": int(row.get("paragraph_count") or 0),
+                "llm_confidence": row.get("llm_confidence"),
+                "segmentation_model": row.get("segmentation_model"),
+                "segmentation_version": row.get("segmentation_version"),
+                "created_at": row.get("created_at"),
+                "updated_at": row.get("updated_at"),
+            }
+
+        async def _run_search_or_time(
+            *,
+            runtime: Any,
+            runtime_config: Dict[str, Any],
+            query_type: str,
+            query: str,
+            top_k: int,
+            use_threshold: bool,
+            time_from: Optional[str],
+            time_to: Optional[str],
+            person: Optional[str],
+            source: Optional[str],
+        ) -> Dict[str, Any]:
+            if getattr(runtime, "retriever", None) is None:
+                return {
+                    "success": False,
+                    "query_type": query_type,
+                    "error": "知识检索器未初始化",
+                    "results": [],
+                    "count": 0,
+                    "content": "",
+                }
+
+            execution = await SearchExecutionService.execute(
+                retriever=runtime.retriever,
+                threshold_filter=runtime.threshold_filter,
+                plugin_config=runtime_config,
+                request=SearchExecutionRequest(
+                    caller="web_api",
+                    stream_id=None,
+                    group_id=None,
+                    user_id=None,
+                    query_type=query_type,
+                    query=str(query or "").strip(),
+                    top_k=top_k,
+                    time_from=str(time_from) if time_from is not None else None,
+                    time_to=str(time_to) if time_to is not None else None,
+                    person=str(person).strip() if person else None,
+                    source=str(source).strip() if source else None,
+                    use_threshold=bool(use_threshold),
+                    enable_ppr=bool(self.plugin.get_config("retrieval.enable_ppr", True)),
+                ),
+                enforce_chat_filter=False,
+                reinforce_access=False,
+            )
+
+            if not execution.success:
+                return {
+                    "success": False,
+                    "query_type": query_type,
+                    "error": execution.error,
+                    "results": [],
+                    "count": 0,
+                    "content": "",
+                }
+
+            serialized = SearchExecutionService.to_serializable_results(execution.results)
+            return {
+                "success": True,
+                "query_type": query_type,
+                "results": serialized,
+                "count": len(serialized),
+                "elapsed_ms": execution.elapsed_ms,
+                "dedup_hit": execution.dedup_hit,
+                "content": "",
+            }
+
+        @self.app.post("/api/query/aggregate")
+        async def query_aggregate(data: AggregateQueryRequest):
+            try:
+                top_k_default = int(
+                    self.plugin.get_config(
+                        "retrieval.aggregate.default_top_k",
+                        self.plugin.get_config("episode.default_top_k", 5),
+                    )
+                )
+                top_k = int(data.top_k if data.top_k is not None else top_k_default)
+                if top_k <= 0:
+                    raise ValueError("top_k 必须大于 0")
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+
+            try:
+                mix_top_k: Optional[int] = None
+                if data.mix_top_k is not None:
+                    mix_top_k = int(data.mix_top_k)
+                    if mix_top_k <= 0:
+                        raise ValueError("mix_top_k 必须大于 0")
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+
+            query = str(data.query or "").strip()
+            time_from = data.time_from
+            time_to = data.time_to
+            person = str(data.person or "").strip() or None
+            source = str(data.source or "").strip() or None
+            use_threshold = bool(data.use_threshold if data.use_threshold is not None else True)
+
+            try:
+                time_from_ts, time_to_ts = parse_query_time_range(time_from, time_to)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=f"时间参数错误: {e}")
+
+            try:
+                runtime_config = _build_runtime_config()
+                runtime = build_search_runtime(
+                    plugin_config=runtime_config,
+                    logger_obj=logger,
+                    owner_tag="web_api",
+                    log_prefix="[MemorixServer-AggregateQuery]",
+                )
+                metadata_store = getattr(runtime, "metadata_store", None)
+                if metadata_store is None:
+                    raise HTTPException(status_code=503, detail="Metadata store not initialized")
+
+                aggregate_service = AggregateQueryService(plugin_config=runtime_config)
+
+                async def _search_runner() -> Dict[str, Any]:
+                    return await _run_search_or_time(
+                        runtime=runtime,
+                        runtime_config=runtime_config,
+                        query_type="search",
+                        query=query,
+                        top_k=top_k,
+                        use_threshold=use_threshold,
+                        time_from=time_from,
+                        time_to=time_to,
+                        person=person,
+                        source=source,
+                    )
+
+                async def _time_runner() -> Dict[str, Any]:
+                    return await _run_search_or_time(
+                        runtime=runtime,
+                        runtime_config=runtime_config,
+                        query_type="time",
+                        query=query,
+                        top_k=top_k,
+                        use_threshold=use_threshold,
+                        time_from=time_from,
+                        time_to=time_to,
+                        person=person,
+                        source=source,
+                    )
+
+                async def _episode_runner() -> Dict[str, Any]:
+                    if not bool(self.plugin.get_config("episode.enabled", True)):
+                        return {
+                            "success": False,
+                            "query_type": "episode",
+                            "error": "episode.enabled=false",
+                            "results": [],
+                            "count": 0,
+                            "content": "❌ Episode 模块未启用",
+                        }
+                    if not bool(self.plugin.get_config("episode.query_enabled", True)):
+                        return {
+                            "success": False,
+                            "query_type": "episode",
+                            "error": "episode.query_enabled=false",
+                            "results": [],
+                            "count": 0,
+                            "content": "❌ Episode 查询已禁用",
+                        }
+
+                    episode_service = EpisodeRetrievalService(
+                        metadata_store=metadata_store,
+                        retriever=getattr(runtime, "retriever", None),
+                    )
+                    rows = await episode_service.query(
+                        query=query,
+                        top_k=max(1, int(top_k)),
+                        time_from=time_from_ts,
+                        time_to=time_to_ts,
+                        person=person,
+                        source=source,
+                        include_paragraphs=False,
+                    )
+                    items = [_serialize_episode(row) for row in rows]
+                    if bool(data.include_paragraphs):
+                        for item in items:
+                            item["paragraphs"] = metadata_store.get_episode_paragraphs(
+                                episode_id=str(item.get("episode_id") or ""),
+                                limit=50,
+                            )
+                    return {
+                        "success": True,
+                        "query_type": "episode",
+                        "results": items,
+                        "count": len(items),
+                        "content": "",
+                    }
+
+                result = await aggregate_service.execute(
+                    query=query,
+                    top_k=top_k,
+                    mix=bool(data.mix),
+                    mix_top_k=mix_top_k,
+                    time_from=time_from,
+                    time_to=time_to,
+                    search_runner=_search_runner,
+                    time_runner=_time_runner,
+                    episode_runner=_episode_runner,
+                )
+                return result
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.error(f"Aggregate query failed: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+    def _register_episode_routes(self, _ensure_write_allowed):
+        def _build_runtime_config() -> Dict[str, Any]:
+            base = dict(getattr(self.plugin, "config", {}) or {})
+            base["vector_store"] = getattr(self.plugin, "vector_store", None)
+            base["graph_store"] = getattr(self.plugin, "graph_store", None)
+            base["metadata_store"] = getattr(self.plugin, "metadata_store", None)
+            base["embedding_manager"] = getattr(self.plugin, "embedding_manager", None)
+            base["sparse_index"] = getattr(self.plugin, "sparse_index", None)
+            base["plugin_instance"] = self.plugin
+            return base
+
+        def _ensure_episode_ready(*, require_query_enabled: bool = True) -> None:
+            if self.plugin.metadata_store is None:
+                raise HTTPException(status_code=503, detail="Metadata store not initialized")
+            if not bool(self.plugin.get_config("episode.enabled", True)):
+                raise HTTPException(status_code=400, detail="Episode module disabled")
+            if require_query_enabled and not bool(self.plugin.get_config("episode.query_enabled", True)):
+                raise HTTPException(status_code=400, detail="Episode query disabled")
+
+        def _serialize_episode(row: Dict[str, Any]) -> Dict[str, Any]:
+            return {
+                "type": "episode",
+                "episode_id": str(row.get("episode_id", "") or ""),
+                "source": str(row.get("source", "") or ""),
+                "title": str(row.get("title", "") or ""),
+                "summary": str(row.get("summary", "") or ""),
+                "time_meta": {
+                    "event_time_start": row.get("event_time_start"),
+                    "event_time_end": row.get("event_time_end"),
+                    "time_granularity": row.get("time_granularity"),
+                    "time_confidence": row.get("time_confidence"),
+                },
+                "participants": list(row.get("participants", []) or []),
+                "keywords": list(row.get("keywords", []) or []),
+                "evidence_ids": list(row.get("evidence_ids", []) or []),
+                "paragraph_count": int(row.get("paragraph_count") or 0),
+                "llm_confidence": row.get("llm_confidence"),
+                "segmentation_model": row.get("segmentation_model"),
+                "segmentation_version": row.get("segmentation_version"),
+                "created_at": row.get("created_at"),
+                "updated_at": row.get("updated_at"),
+            }
+
+        @self.app.post("/api/episodes/query")
+        async def query_episodes(data: EpisodeQueryRequest):
+            _ensure_episode_ready()
+            try:
+                top_k_default = int(self.plugin.get_config("episode.default_top_k", 5))
+                top_k = int(data.top_k if data.top_k is not None else top_k_default)
+                if top_k <= 0:
+                    raise ValueError("top_k 必须大于 0")
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+
+            try:
+                ts_from, ts_to = parse_query_time_range(data.time_from, data.time_to)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=f"时间参数错误: {e}")
+
+            try:
+                runtime_config = _build_runtime_config()
+                runtime = build_search_runtime(
+                    plugin_config=runtime_config,
+                    logger_obj=logger,
+                    owner_tag="web_api",
+                    log_prefix="[MemorixServer-EpisodeQuery]",
+                )
+                episode_service = EpisodeRetrievalService(
+                    metadata_store=self.plugin.metadata_store,
+                    retriever=getattr(runtime, "retriever", None),
+                )
+                rows = await episode_service.query(
+                    query=str(data.query or "").strip(),
+                    top_k=top_k,
+                    time_from=ts_from,
+                    time_to=ts_to,
+                    person=str(data.person or "").strip() or None,
+                    source=str(data.source or "").strip() or None,
+                    include_paragraphs=False,
+                )
+                items = [_serialize_episode(row) for row in rows]
+                if bool(data.include_paragraphs):
+                    for item in items:
+                        item["paragraphs"] = self.plugin.metadata_store.get_episode_paragraphs(
+                            episode_id=item["episode_id"],
+                            limit=50,
+                        )
+                return {"success": True, "items": items}
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.error(f"Episode query failed: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @self.app.get("/api/episodes/list")
+        async def list_episodes(
+            source: Optional[str] = None,
+            person: Optional[str] = None,
+            time_from: Optional[str] = None,
+            time_to: Optional[str] = None,
+            limit: int = Query(20, ge=1, le=200),
+        ):
+            _ensure_episode_ready()
+            try:
+                ts_from, ts_to = parse_query_time_range(time_from, time_to)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=f"时间参数错误: {e}")
+
+            try:
+                runtime_config = _build_runtime_config()
+                runtime = build_search_runtime(
+                    plugin_config=runtime_config,
+                    logger_obj=logger,
+                    owner_tag="web_api",
+                    log_prefix="[MemorixServer-EpisodeList]",
+                )
+                episode_service = EpisodeRetrievalService(
+                    metadata_store=self.plugin.metadata_store,
+                    retriever=getattr(runtime, "retriever", None),
+                )
+                rows = await episode_service.query(
+                    query="",
+                    top_k=int(limit),
+                    time_from=ts_from,
+                    time_to=ts_to,
+                    person=str(person or "").strip() or None,
+                    source=str(source or "").strip() or None,
+                    include_paragraphs=False,
+                )
+                items = [_serialize_episode(row) for row in rows]
+                return {"success": True, "items": items}
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.error(f"Episode list failed: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @self.app.post("/api/episodes/rebuild")
+        async def rebuild_episodes(data: EpisodeRebuildRequest):
+            _ensure_episode_ready(require_query_enabled=False)
+            _ensure_write_allowed()
+
+            scope = str(data.scope or "source").strip().lower()
+            if scope not in {"source", "all"}:
+                raise HTTPException(status_code=400, detail="scope 必须是 source 或 all")
+
+            if scope == "source":
+                token = str(data.source or "").strip()
+                if not token:
+                    raise HTTPException(status_code=400, detail="source 不能为空")
+                enqueued = int(
+                    self.plugin.metadata_store.enqueue_episode_source_rebuild(
+                        token,
+                        reason="api_rebuild_source",
+                    )
+                )
+                return {
+                    "success": True,
+                    "scope": "source",
+                    "enqueued": enqueued,
+                    "sources": [token],
+                }
+
+            sources = self.plugin.metadata_store.list_episode_sources_for_rebuild()
+            enqueued = 0
+            for source_token in sources:
+                enqueued += int(
+                    self.plugin.metadata_store.enqueue_episode_source_rebuild(
+                        source_token,
+                        reason="api_rebuild_all",
+                    )
+                )
+            return {
+                "success": True,
+                "scope": "all",
+                "enqueued": enqueued,
+                "sources": list(sources),
+            }
+
+        @self.app.get("/api/episodes/rebuild/status")
+        async def get_episode_rebuild_status():
+            _ensure_episode_ready(require_query_enabled=False)
+            summary = self.plugin.metadata_store.get_episode_source_rebuild_summary()
+            running = list(summary.get("running") or [])
+            failed = list(summary.get("failed") or [])
+            current_running_source = running[0]["source"] if running else None
+            return {
+                "success": True,
+                "counts": dict(summary.get("counts") or {}),
+                "current_running_source": current_running_source,
+                "running": running,
+                "failed": failed,
+            }
+
+        @self.app.get("/api/episodes/{episode_id}")
+        async def get_episode(
+            episode_id: str,
+            include_paragraphs: bool = Query(False),
+            paragraph_limit: int = Query(100, ge=1, le=300),
+        ):
+            _ensure_episode_ready()
+            token = str(episode_id or "").strip()
+            if not token:
+                raise HTTPException(status_code=400, detail="episode_id 不能为空")
+
+            try:
+                row = self.plugin.metadata_store.get_episode_by_id(token)
+                if not row:
+                    raise HTTPException(status_code=404, detail="Episode not found")
+                if self.plugin.metadata_store.is_episode_source_query_blocked(
+                    str(row.get("source", "") or "").strip()
+                ):
+                    raise HTTPException(status_code=409, detail="Episode source rebuilding")
+                episode = _serialize_episode(row)
+                paragraphs = []
+                if include_paragraphs:
+                    paragraphs = self.plugin.metadata_store.get_episode_paragraphs(
+                        episode_id=token,
+                        limit=int(paragraph_limit),
+                    )
+                payload = {"success": True, "episode": episode}
+                if include_paragraphs:
+                    payload["paragraphs"] = paragraphs
+                return payload
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.error(f"Get episode failed: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+    def _register_memory_routes(self, _ensure_write_allowed):
         # --- V5 记忆管理端点 ---
         
         class MemoryProtectRequest(BaseModel):
@@ -1429,9 +1969,9 @@ class MemorixServer:
             try:
                 if data.type == "entity":
                     # 复活实体
-                    cursor = self.plugin.metadata_store._conn.cursor()
-                    cursor.execute("UPDATE entities SET is_deleted=0, deleted_at=NULL WHERE hash=?", (data.hash,))
-                    self.plugin.metadata_store._conn.commit()
+                    restored = self.plugin.metadata_store.restore_entity_by_hash(data.hash)
+                    if not restored:
+                        raise HTTPException(status_code=404, detail="回收站中未找到该实体")
                     return {"success": True, "type": "entity", "hash": data.hash}
 
                 # relation: 先从回收站恢复元数据，再回灌图边
@@ -1470,13 +2010,9 @@ class MemorixServer:
             
             try:
                 gst = self.plugin.graph_store
-                s_idx = gst._node_to_idx.get(gst._canonicalize(s))
-                t_idx = gst._node_to_idx.get(gst._canonicalize(t))
-                
-                if s_idx is not None and t_idx is not None:
-                     hashes = gst._edge_hash_map.get((s_idx, t_idx), set())
-                     if hashes:
-                         self.plugin.metadata_store.reinforce_relations(list(hashes))
+                hashes = gst.get_relation_hashes_for_edge(s, t)
+                if hashes:
+                    self.plugin.metadata_store.reinforce_relations(list(hashes))
                 
                 # 稍微提升权重
                 self.plugin.graph_store.update_edge_weight(s, t, 0.1) 
@@ -1498,14 +2034,10 @@ class MemorixServer:
 
             try:
                 gst = self.plugin.graph_store
-                s_idx = gst._node_to_idx.get(gst._canonicalize(s))
-                t_idx = gst._node_to_idx.get(gst._canonicalize(t))
-                
+                hashes = gst.get_relation_hashes_for_edge(s, t)
                 # 1. 在元数据中标记为不活跃
-                if s_idx is not None and t_idx is not None:
-                     hashes = gst._edge_hash_map.get((s_idx, t_idx), set())
-                     if hashes:
-                         self.plugin.metadata_store.mark_relations_inactive(list(hashes))
+                if hashes:
+                    self.plugin.metadata_store.mark_relations_inactive(list(hashes))
                 
                 # 2. 在图中停用 (移除边但保留映射)
                 gst.deactivate_edges([(s, t)])
@@ -1527,23 +2059,26 @@ class MemorixServer:
 
             try:
                 gst = self.plugin.graph_store
-                s_idx = gst._node_to_idx.get(gst._canonicalize(s))
-                t_idx = gst._node_to_idx.get(gst._canonicalize(t))
-                
-                if s_idx is not None and t_idx is not None:
-                     hashes = gst._edge_hash_map.get((s_idx, t_idx), set())
-                     if hashes:
-                         h_list = list(hashes)
-                         is_pinned = (data.type == "pin")
-                         ttl = data.duration * 3600 if data.type == "ttl" else 0
-                         
-                         self.plugin.metadata_store.protect_relations(h_list, is_pinned=is_pinned, ttl_seconds=ttl)
+                hashes = gst.get_relation_hashes_for_edge(s, t)
+                if hashes:
+                    h_list = list(hashes)
+                    is_pinned = (data.type == "pin")
+                    ttl = data.duration * 3600 if data.type == "ttl" else 0
+                    self.plugin.metadata_store.protect_relations(h_list, is_pinned=is_pinned, ttl_seconds=ttl)
                 
                 return {"success": True}
             except Exception as e:
                  logger.error(f"Protect failed: {e}")
                  raise HTTPException(status_code=500, detail=str(e))
 
+
+    def _register_person_profile_routes(
+        self,
+        _ensure_write_allowed,
+        _build_person_profile_service,
+        _resolve_person_id_for_web,
+        _parse_group_nicks,
+    ):
         @self.app.post("/api/person_profile/query")
         async def query_person_profile(data: PersonProfileQueryRequest):
             """查询人物画像（自动画像 + 手工覆盖结果）。"""
@@ -1718,6 +2253,15 @@ class MemorixServer:
                 raise HTTPException(status_code=500, detail=str(e))
 
 
+
+    def _register_admin_routes(self, _ensure_write_allowed):
+        async def _build_runtime_self_check_payload(force: bool = False) -> Dict[str, Any]:
+            report = await ensure_runtime_self_check(self.plugin, force=bool(force))
+            return {
+                "success": True,
+                "report": dict(report or {}),
+            }
+
         @self.app.post("/api/save")
         async def manual_save():
             """手动保存所有数据到磁盘"""
@@ -1744,6 +2288,24 @@ class MemorixServer:
                 "auto_save_interval": self.plugin.get_config("advanced.auto_save_interval_minutes", 5)
             }
 
+        @self.app.get("/api/runtime/self_check")
+        async def get_runtime_self_check():
+            """获取当前缓存的 runtime 自检结果；无缓存时会即时执行一次。"""
+            try:
+                return await _build_runtime_self_check_payload(force=False)
+            except Exception as e:
+                logger.error(f"Get runtime self-check failed: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @self.app.post("/api/runtime/self_check/refresh")
+        async def refresh_runtime_self_check():
+            """强制刷新 runtime 自检结果。"""
+            try:
+                return await _build_runtime_self_check_payload(force=True)
+            except Exception as e:
+                logger.error(f"Refresh runtime self-check failed: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
         @self.app.post("/api/config/auto_save")
         async def set_auto_save(data: AutoSaveConfig):
             """设置自动保存开关（仅运行时生效）"""
@@ -1752,6 +2314,13 @@ class MemorixServer:
             logger.info(f"自动保存已{'启用' if data.enabled else '禁用'}（运行时）")
             return {"success": True, "auto_save_enabled": data.enabled}
 
+
+    def _register_import_routes(
+        self,
+        _is_import_enabled,
+        _ensure_import_token,
+        _load_import_guide_text,
+    ):
         @self.app.post("/api/import/tasks/upload")
         async def create_import_task_upload(
             files: Optional[List[UploadFile]] = File(default=None),
@@ -1996,6 +2565,129 @@ class MemorixServer:
                 logger.error(f"Retry failed import task error: {e}")
                 raise HTTPException(status_code=500, detail=str(e))
 
+
+    def _register_retrieval_tuning_routes(self, _is_tuning_enabled):
+        @self.app.get("/api/retrieval_tuning/profile")
+        async def get_retrieval_tuning_profile():
+            if not _is_tuning_enabled():
+                raise HTTPException(status_code=404, detail="检索调优功能未启用")
+            profile = self.tuning_manager.get_profile_snapshot()
+            settings = self.tuning_manager.get_runtime_settings()
+            return {"success": True, "profile": profile, "settings": settings}
+
+        @self.app.post("/api/retrieval_tuning/profile/apply")
+        async def apply_retrieval_tuning_profile(data: RetrievalTuningProfileApplyRequest):
+            if not _is_tuning_enabled():
+                raise HTTPException(status_code=404, detail="检索调优功能未启用")
+            try:
+                result = await self.tuning_manager.apply_profile(
+                    data.profile,
+                    reason=str(data.reason or "manual_apply"),
+                )
+                return {"success": True, **result}
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+            except Exception as e:
+                logger.error(f"Apply retrieval profile failed: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @self.app.post("/api/retrieval_tuning/profile/rollback")
+        async def rollback_retrieval_tuning_profile():
+            if not _is_tuning_enabled():
+                raise HTTPException(status_code=404, detail="检索调优功能未启用")
+            try:
+                result = await self.tuning_manager.rollback_profile()
+                return {"success": True, **result}
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+            except Exception as e:
+                logger.error(f"Rollback retrieval profile failed: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @self.app.get("/api/retrieval_tuning/profile/export_toml")
+        async def export_retrieval_tuning_profile_toml():
+            if not _is_tuning_enabled():
+                raise HTTPException(status_code=404, detail="检索调优功能未启用")
+            snippet = self.tuning_manager.export_toml_snippet()
+            return {"success": True, "toml": snippet}
+
+        @self.app.post("/api/retrieval_tuning/tasks")
+        async def create_retrieval_tuning_task(data: RetrievalTuningTaskCreateRequest):
+            if not _is_tuning_enabled():
+                raise HTTPException(status_code=404, detail="检索调优功能未启用")
+            try:
+                task = await self.tuning_manager.create_task(data.model_dump(exclude_none=True))
+                return {"success": True, "task": task}
+            except ValueError as e:
+                message = str(e)
+                status_code = 409 if "导入任务运行中" in message else 400
+                raise HTTPException(status_code=status_code, detail=message)
+            except Exception as e:
+                logger.error(f"Create retrieval tuning task failed: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @self.app.get("/api/retrieval_tuning/tasks")
+        async def list_retrieval_tuning_tasks(limit: int = Query(50, ge=1, le=500)):
+            if not _is_tuning_enabled():
+                raise HTTPException(status_code=404, detail="检索调优功能未启用")
+            items = await self.tuning_manager.list_tasks(limit=limit)
+            return {"success": True, "items": items}
+
+        @self.app.get("/api/retrieval_tuning/tasks/{task_id}")
+        async def get_retrieval_tuning_task(task_id: str, include_rounds: bool = Query(False)):
+            if not _is_tuning_enabled():
+                raise HTTPException(status_code=404, detail="检索调优功能未启用")
+            task = await self.tuning_manager.get_task(task_id, include_rounds=include_rounds)
+            if not task:
+                raise HTTPException(status_code=404, detail="任务不存在")
+            return {"success": True, "task": task}
+
+        @self.app.get("/api/retrieval_tuning/tasks/{task_id}/rounds")
+        async def get_retrieval_tuning_task_rounds(
+            task_id: str,
+            offset: int = Query(0, ge=0),
+            limit: int = Query(50, ge=1, le=500),
+        ):
+            if not _is_tuning_enabled():
+                raise HTTPException(status_code=404, detail="检索调优功能未启用")
+            rows = await self.tuning_manager.get_rounds(task_id, offset=offset, limit=limit)
+            if rows is None:
+                raise HTTPException(status_code=404, detail="任务不存在")
+            return {"success": True, **rows}
+
+        @self.app.post("/api/retrieval_tuning/tasks/{task_id}/cancel")
+        async def cancel_retrieval_tuning_task(task_id: str):
+            if not _is_tuning_enabled():
+                raise HTTPException(status_code=404, detail="检索调优功能未启用")
+            task = await self.tuning_manager.cancel_task(task_id)
+            if not task:
+                raise HTTPException(status_code=404, detail="任务不存在")
+            return {"success": True, "task": task}
+
+        @self.app.post("/api/retrieval_tuning/tasks/{task_id}/apply_best")
+        async def apply_best_retrieval_tuning_task(task_id: str):
+            if not _is_tuning_enabled():
+                raise HTTPException(status_code=404, detail="检索调优功能未启用")
+            try:
+                result = await self.tuning_manager.apply_best(task_id)
+                return {"success": True, **result}
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+            except Exception as e:
+                logger.error(f"Apply best retrieval tuning task failed: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @self.app.get("/api/retrieval_tuning/tasks/{task_id}/report")
+        async def get_retrieval_tuning_task_report(task_id: str, format: str = Query("md")):
+            if not _is_tuning_enabled():
+                raise HTTPException(status_code=404, detail="检索调优功能未启用")
+            report = await self.tuning_manager.get_report(task_id, fmt=format)
+            if report is None:
+                raise HTTPException(status_code=404, detail="任务不存在")
+            return {"success": True, **report}
+
+
+    def _register_page_routes(self, _is_import_enabled, _is_tuning_enabled):
         @self.app.get("/import")
         async def import_page():
             """返回导入中心页面"""
@@ -2005,6 +2697,15 @@ class MemorixServer:
             if html_path.exists():
                 return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
             return HTMLResponse(content="<h1>Import UI Not Found</h1>")
+
+        @self.app.get("/tuning")
+        async def tuning_page():
+            if not _is_tuning_enabled():
+                raise HTTPException(status_code=404, detail="检索调优功能未启用")
+            html_path = Path(__file__).parent / "web" / "tuning.html"
+            if html_path.exists():
+                return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
+            return HTMLResponse(content="<h1>Tuning UI Not Found</h1>")
 
         @self.app.get("/")
         async def index():

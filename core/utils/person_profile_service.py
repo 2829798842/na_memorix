@@ -19,6 +19,7 @@ from ..retrieval import (
     DualPathRetrieverConfig,
     SparseBM25Config,
     FusionConfig,
+    GraphRelationRecallConfig,
 )
 from ..storage import MetadataStore, GraphStore, VectorStore
 
@@ -72,13 +73,17 @@ class PersonProfileService:
         try:
             sparse_cfg_raw = self._cfg("retrieval.sparse", {}) or {}
             fusion_cfg_raw = self._cfg("retrieval.fusion", {}) or {}
+            graph_recall_cfg_raw = self._cfg("retrieval.search.graph_recall", {}) or {}
             if not isinstance(sparse_cfg_raw, dict):
                 sparse_cfg_raw = {}
             if not isinstance(fusion_cfg_raw, dict):
                 fusion_cfg_raw = {}
+            if not isinstance(graph_recall_cfg_raw, dict):
+                graph_recall_cfg_raw = {}
 
             sparse_cfg = SparseBM25Config(**sparse_cfg_raw)
             fusion_cfg = FusionConfig(**fusion_cfg_raw)
+            graph_recall_cfg = GraphRelationRecallConfig(**graph_recall_cfg_raw)
             config = DualPathRetrieverConfig(
                 top_k_paragraphs=int(self._cfg("retrieval.top_k_paragraphs", 20)),
                 top_k_relations=int(self._cfg("retrieval.top_k_relations", 10)),
@@ -92,6 +97,7 @@ class PersonProfileService:
                 debug=bool(self._cfg("advanced.debug", False)),
                 sparse=sparse_cfg,
                 fusion=fusion_cfg,
+                graph_recall=graph_recall_cfg,
             )
             return DualPathRetriever(
                 vector_store=self.vector_store,

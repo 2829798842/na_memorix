@@ -33,6 +33,19 @@ sys.path.insert(0, str(plugin_root))
 project_root = plugin_root.parent.parent
 sys.path.insert(0, str(project_root))
 
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="将 LPMM OpenIE JSON 导入 A_memorix")
+    parser.add_argument("path", help="LPMM JSON 文件路径或包含这些文件的目录")
+    parser.add_argument("--force", action="store_true", help="强制重新导入")
+    parser.add_argument("--concurrency", "-c", type=int, default=5, help="并发数")
+    return parser
+
+
+# --help/-h fast path: avoid heavy host/plugin bootstrap
+if any(arg in {"-h", "--help"} for arg in sys.argv[1:]):
+    _build_arg_parser().print_help()
+    sys.exit(0)
+
 try:
     from scripts.process_knowledge import AutoImporter
     # 尝试导入 hash 工具
@@ -107,11 +120,7 @@ class LPMMConverter:
 
 
 async def main():
-    parser = argparse.ArgumentParser(description="将 LPMM OpenIE JSON 导入 A_memorix")
-    parser.add_argument("path", help="LPMM JSON 文件路径或包含这些文件的目录")
-    parser.add_argument("--force", action="store_true", help="强制重新导入")
-    parser.add_argument("--concurrency", "-c", type=int, default=5, help="并发数")
-    
+    parser = _build_arg_parser()
     args = parser.parse_args()
     
     target_path = Path(args.path)

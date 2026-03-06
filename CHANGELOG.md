@@ -1,5 +1,31 @@
 # 更新日志 (Changelog)
 
+## [1.0.0] - 2026-03-06
+
+本次 `1.0.0` 为主版本升级，主线是 **运行时架构模块化**、**Episode 情景记忆闭环**、**聚合检索与图召回增强**、**离线迁移 / 运行时自检 / 检索调优中心**。
+
+### 🔖 版本信息
+
+- 插件版本：`0.7.0` → `1.0.0`
+- 配置版本：`4.1.0`（不变）
+
+### 🚀 重点能力
+
+- 运行时重构：
+  - `plugin.py` 大幅瘦身，生命周期、后台任务、请求路由、检索运行时初始化拆分到 `core/runtime/*`。
+  - 配置 schema 抽离到 `core/config/plugin_config_schema.py`，`_manifest.json` 同步扩展新配置项。
+- 检索与查询增强：
+  - `KnowledgeQueryTool` 拆分为 query mode + orchestrator，新增长 `aggregate` / `episode` 查询模式。
+  - 新增图辅助关系召回、统一 forward/runtime 构建与请求去重桥接。
+- Episode / 运维能力：
+  - `metadata_store` schema 升级到 `SCHEMA_VERSION = 7`，新增 `episodes` / `episode_paragraphs` / rebuild queue 等结构。
+  - 新增 `release_vnext_migrate.py`、`runtime_self_check.py`、`rebuild_episodes.py` 与 Web 检索调优页 `web/tuning.html`。
+
+### 📚 文档同步
+
+- 版本号同步到 `plugin.py`、`__init__.py`、`_manifest.json`、`README.md` 与 `CONFIG_REFERENCE.md`。
+- 新增 `RELEASE_SUMMARY_1.0.0.md`
+
 ## [0.7.0] - 2026-03-04
 
 本次 `0.7.0` 为中版本升级，主线是 **关系向量化闭环（写入 + 状态机 + 回填 + 审计）**、**检索/命令链路增强** 与 **导入任务能力补齐**。

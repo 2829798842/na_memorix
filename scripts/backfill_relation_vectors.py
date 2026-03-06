@@ -28,6 +28,40 @@ PROJECT_ROOT = PLUGIN_ROOT.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PLUGIN_ROOT))
 
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="关系向量一次性回填")
+    parser.add_argument(
+        "--config",
+        default=str(PLUGIN_ROOT / "config.toml"),
+        help="配置文件路径（默认 plugins/A_memorix/config.toml）",
+    )
+    parser.add_argument(
+        "--data-dir",
+        default=str(PLUGIN_ROOT / "data"),
+        help="数据目录（默认 plugins/A_memorix/data）",
+    )
+    parser.add_argument(
+        "--states",
+        default="none,failed,pending",
+        help="待处理状态列表，逗号分隔",
+    )
+    parser.add_argument("--limit", type=int, default=50000, help="最大处理数量")
+    parser.add_argument("--concurrency", type=int, default=8, help="并发数")
+    parser.add_argument("--max-retry", type=int, default=None, help="最大重试次数过滤")
+    parser.add_argument(
+        "--include-ready-missing",
+        action="store_true",
+        help="额外纳入 vector_state=ready 但向量缺失的关系",
+    )
+    parser.add_argument("--dry-run", action="store_true", help="仅统计候选，不写入")
+    return parser
+
+
+# --help/-h fast path: avoid heavy host/plugin bootstrap
+if any(arg in {"-h", "--help"} for arg in sys.argv[1:]):
+    _build_arg_parser().print_help()
+    raise SystemExit(0)
+
 from core.storage import (
     VectorStore,
     GraphStore,
@@ -47,15 +81,15 @@ def _load_config(config_path: Path) -> Dict[str, Any]:
 
 def _build_vector_store(data_dir: Path, emb_cfg: Dict[str, Any]) -> VectorStore:
     q_type = str(emb_cfg.get("quantization_type", "int8")).lower()
-    q_map = {
-        "float32": QuantizationType.FLOAT32,
-        "int8": QuantizationType.INT8,
-        "pq": QuantizationType.PQ,
-    }
+    if q_type != "int8":
+        raise ValueError(
+            "embedding.quantization_type 在 vNext 仅允许 int8(SQ8)。"
+            " 请先执行 scripts/release_vnext_migrate.py migrate。"
+        )
     dim = int(emb_cfg.get("dimension", 1024))
     store = VectorStore(
         dimension=max(1, dim),
-        quantization_type=q_map.get(q_type, QuantizationType.INT8),
+        quantization_type=QuantizationType.INT8,
         data_dir=data_dir / "vectors",
     )
     if store.has_data():
@@ -228,32 +262,7 @@ async def main_async(args: argparse.Namespace) -> int:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="关系向量一次性回填")
-    parser.add_argument(
-        "--config",
-        default=str(PLUGIN_ROOT / "config.toml"),
-        help="配置文件路径（默认 plugins/A_memorix/config.toml）",
-    )
-    parser.add_argument(
-        "--data-dir",
-        default=str(PLUGIN_ROOT / "data"),
-        help="数据目录（默认 plugins/A_memorix/data）",
-    )
-    parser.add_argument(
-        "--states",
-        default="none,failed,pending",
-        help="待处理状态列表，逗号分隔",
-    )
-    parser.add_argument("--limit", type=int, default=50000, help="最大处理数量")
-    parser.add_argument("--concurrency", type=int, default=8, help="并发数")
-    parser.add_argument("--max-retry", type=int, default=None, help="最大重试次数过滤")
-    parser.add_argument(
-        "--include-ready-missing",
-        action="store_true",
-        help="额外纳入 vector_state=ready 但向量缺失的关系",
-    )
-    parser.add_argument("--dry-run", action="store_true", help="仅统计候选，不写入")
-    return parser.parse_args()
+    return _build_arg_parser().parse_args()
 
 
 if __name__ == "__main__":

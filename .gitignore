@@ -218,6 +218,10 @@ full_diff.txt
 机娘导论-openie.json
 scripts/机娘导论-openie.json
 
+# A_memorix recall/tuning generated artifacts
+artifacts/
+scripts/run_arc_light_recall_pipeline.py
+
 # Compressed Data Archives
 data.zip
 scripts/full_feature_smoke_test.py

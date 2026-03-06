@@ -65,6 +65,17 @@ class VectorStore:
         self.data_dir = Path(data_dir) if data_dir else None
         if self.data_dir:
             self.data_dir.mkdir(parents=True, exist_ok=True)
+        if quantization_type != QuantizationType.INT8:
+            raise ValueError(
+                "vNext 仅支持 quantization_type=int8(SQ8)。"
+                " 请更新配置并执行 scripts/release_vnext_migrate.py migrate。"
+            )
+        normalized_index_type = str(index_type or "sq8").strip().lower()
+        if normalized_index_type not in {"sq8", "int8"}:
+            raise ValueError(
+                "vNext 仅支持 index_type=sq8。"
+                " 请更新配置并执行 scripts/release_vnext_migrate.py migrate。"
+            )
         self.quantization_type = QuantizationType.INT8 
         self.index_type = "sq8" 
         self.buffer_size = buffer_size
@@ -170,7 +181,7 @@ class VectorStore:
             self._write_buffer_ids.extend(processed_int_ids)
 
             if len(self._write_buffer_ids) >= self.buffer_size:
-                self._flush_write_buffer()
+                self._flush_write_buffer_unlocked()
 
             if not self._is_trained:
                 # 双写到回退索引
@@ -180,13 +191,16 @@ class VectorStore:
                 # 这里的 TRAIN_SIZE 取默认 10k，或者根据当前数据量动态判断
                 if len(self._reservoir_buffer) >= 10000:
                     logger.info(f"训练样本达到上限，开始训练...")
-                    self._train_and_replay()
+                    self._train_and_replay_unlocked()
 
             self._total_added += len(batch_ids)
             return len(batch_ids)
     
     def _flush_write_buffer(self):
-        # Assumes caller holds lock or is internal
+        with self._lock:
+            self._flush_write_buffer_unlocked()
+
+    def _flush_write_buffer_unlocked(self):
         if not self._write_buffer_vecs:
             return
 
@@ -225,7 +239,10 @@ class VectorStore:
                         self._reservoir_buffer[r] = vec
 
     def _train_and_replay(self):
-        # Assumes caller holds lock
+        with self._lock:
+            self._train_and_replay_unlocked()
+
+    def _train_and_replay_unlocked(self):
         if not self._reservoir_buffer:
             logger.warning("No training data available.")
             return
@@ -291,18 +308,6 @@ class VectorStore:
         k: int = 10,
         filter_deleted: bool = True,
     ) -> Tuple[List[str], List[float]]:
-        # 查询路径仅负责检索，不在此触发训练/回放。
-        # 训练/回放前置到 warmup_index()，并由插件启动阶段触发。
-        with self._lock:
-            self._flush_write_buffer()
-
-        # 最终搜索源选择
-        search_index = self._index if (self._is_trained and self._index.ntotal > 0) else self._fallback_index
-        
-        if search_index.ntotal == 0:
-            logger.warning("Indices are empty. No data to search.")
-            return [], []
-
         query_local = np.array(query, dtype=np.float32, order="C", copy=True)
         if query_local.ndim == 1:
             got_dim = int(query_local.shape[0])
@@ -326,9 +331,18 @@ class VectorStore:
             raise ValueError("query embedding contains non-finite values")
 
         faiss.normalize_L2(query_local)
-        
-        # 执行检索
-        dists, ids = search_index.search(query_local, k * 2)
+
+        # 查询路径仅负责检索，不在此触发训练/回放。
+        # 训练/回放前置到 warmup_index()，并由插件启动阶段触发。
+        # Faiss 索引在并发 search 下可能出现阻塞，这里串行化检索调用保证稳定性。
+        with self._lock:
+            self._flush_write_buffer_unlocked()
+            search_index = self._index if (self._is_trained and self._index.ntotal > 0) else self._fallback_index
+            if search_index.ntotal == 0:
+                logger.warning("Indices are empty. No data to search.")
+                return [], []
+            # 执行检索
+            dists, ids = search_index.search(query_local, k * 2)
         
         # Faiss search 返回的是 (1, K) 的数组，取第一行
         dists = dists[0]
@@ -431,8 +445,11 @@ class VectorStore:
         return summary
 
     def _bootstrap_fallback_from_disk(self):
+        with self._lock:
+            self._bootstrap_fallback_from_disk_unlocked()
+
+    def _bootstrap_fallback_from_disk_unlocked(self):
         """重启后自举：从磁盘 vectors.bin 加载数据到 fallback 索引"""
-        # Internal method, lock should be held by caller
         if not self._bin_path.exists() or not self._ids_bin_path.exists():
             return
 
@@ -459,7 +476,10 @@ class VectorStore:
         logger.info(f"Fallback index self-bootstrapped with {self._fallback_index.ntotal} items.")
 
     def _force_train_small_data(self):
-        # Internal method, lock should be held by caller
+        with self._lock:
+            self._force_train_small_data_unlocked()
+
+    def _force_train_small_data_unlocked(self):
         logger.info("Forcing training on small dataset...")
         self._reservoir_buffer = [] 
         
@@ -479,7 +499,7 @@ class VectorStore:
                     if len(self._reservoir_buffer) >= self.TRAIN_SIZE:
                         break
         
-        self._train_and_replay()
+        self._train_and_replay_unlocked()
 
     def delete(self, ids: List[str]) -> int:
         with self._lock:
@@ -504,7 +524,6 @@ class VectorStore:
 
     def _check_rebuild_needed(self):
         """GC Excution Check"""
-        # Internal check, lock held by delete
         if self._bin_count == 0: return
         ratio = len(self._deleted_ids) / self._bin_count
         if ratio > 0.3 and len(self._deleted_ids) > 1000:
@@ -513,8 +532,11 @@ class VectorStore:
 
     def rebuild_index(self):
         """GC: 重建索引，压缩 bin 文件"""
-        # TODO: This logic is complex and should be protected by lock
-        # Caller holds lock (from delete -> check -> rebuild), so it is safe.
+        with self._lock:
+            self._rebuild_index_locked()
+
+    def _rebuild_index_locked(self):
+        """实际 GC 重建逻辑。"""
         logger.info("Starting Compaction (GC)...")
         
         tmp_bin = self.data_dir / "vectors.bin.tmp"
@@ -572,14 +594,16 @@ class VectorStore:
 
     def save(self, data_dir: Optional[Union[str, Path]] = None) -> None:
         with self._lock:
-            if not data_dir: data_dir = self.data_dir
-            if not data_dir: raise ValueError("No data_dir")
-            
+            if not data_dir:
+                data_dir = self.data_dir
+            if not data_dir:
+                raise ValueError("No data_dir")
+
             data_dir = Path(data_dir)
             data_dir.mkdir(parents=True, exist_ok=True)
-            
-            self._flush_write_buffer()
-            
+
+            self._flush_write_buffer_unlocked()
+
             if self._is_trained:
                 index_path = data_dir / "vectors.index"
                 with atomic_save_path(index_path) as tmp:
@@ -599,6 +623,42 @@ class VectorStore:
                 
             logger.info("VectorStore saved.")
 
+    def migrate_legacy_npy(self, data_dir: Optional[Union[str, Path]] = None) -> Dict[str, Any]:
+        """
+        离线迁移入口：将 legacy vectors.npy 转为 vNext 二进制格式。
+        """
+        with self._lock:
+            target_dir = Path(data_dir) if data_dir else self.data_dir
+            if target_dir is None:
+                raise ValueError("No data_dir")
+            target_dir = Path(target_dir)
+            npy_path = target_dir / "vectors.npy"
+            idx_path = target_dir / "vectors.index"
+            bin_path = target_dir / "vectors.bin"
+            ids_bin_path = target_dir / "vectors_ids.bin"
+            meta_path = target_dir / "vectors_metadata.pkl"
+
+            if not npy_path.exists():
+                return {"migrated": False, "reason": "npy_missing"}
+            if not meta_path.exists():
+                raise RuntimeError("legacy vectors.npy migration requires vectors_metadata.pkl")
+            if bin_path.exists() and ids_bin_path.exists():
+                return {"migrated": False, "reason": "bin_exists"}
+
+            # Reset in-memory state to avoid appending to stale runtime buffers.
+            self._known_hashes.clear()
+            self._deleted_ids.clear()
+            self._write_buffer_vecs.clear()
+            self._write_buffer_ids.clear()
+            self._init_index()
+            self._init_fallback_index()
+            self._is_trained = False
+            self._bin_count = 0
+
+            self._migrate_from_npy_unlocked(npy_path, idx_path, target_dir)
+            self.save(target_dir)
+            return {"migrated": True, "reason": "ok"}
+
     def load(self, data_dir: Optional[Union[str, Path]] = None) -> None:
         with self._lock:
             if not data_dir: data_dir = self.data_dir
@@ -609,9 +669,10 @@ class VectorStore:
             bin_path = data_dir / "vectors.bin"
             
             if npy_path.exists() and not bin_path.exists():
-                logger.info("Found legacy .npy, migrating to .bin...")
-                self._migrate_from_npy(npy_path, idx_path, data_dir)
-                return
+                raise RuntimeError(
+                    "检测到 legacy vectors.npy，vNext 不再支持运行时自动迁移。"
+                    " 请先执行 scripts/release_vnext_migrate.py migrate。"
+                )
 
             meta_path = data_dir / "vectors_metadata.pkl"
             if not meta_path.exists():
@@ -655,9 +716,10 @@ class VectorStore:
                 self._bin_count = bin_path.stat().st_size // (self.dimension * 2)
 
     def _migrate_from_npy(self, npy_path, idx_path, data_dir):
-        # Assumed safe to run without lock as it is called from inside load() which is locked (if load is used correctly)
-        # But for safety, recursive lock helps.
-        
+        with self._lock:
+            self._migrate_from_npy_unlocked(npy_path, idx_path, data_dir)
+
+    def _migrate_from_npy_unlocked(self, npy_path, idx_path, data_dir):
         try:
             arr = np.load(npy_path, mmap_mode="r")
         except Exception:

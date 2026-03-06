@@ -31,49 +31,20 @@ def backfill(
 ) -> int:
     store = MetadataStore(data_dir=data_dir)
     store.connect()
-    cursor = store._conn.cursor()
-
-    sql = """
-        SELECT hash, created_at
-        FROM paragraphs
-        WHERE (event_time IS NULL AND event_time_start IS NULL AND event_time_end IS NULL)
-        ORDER BY created_at DESC
-        LIMIT ?
-    """
-    cursor.execute(sql, (limit,))
-    rows = cursor.fetchall()
-    count = len(rows)
-
-    if dry_run:
-        print(f"[dry-run] candidates={count}")
-        store.close()
-        return count
-
-    if no_created_fallback:
-        print(f"skip update (no-created-fallback), candidates={count}")
-        store.close()
-        return 0
-
-    updated = 0
-    for row in rows:
-        created_at = row["created_at"]
-        if created_at is None:
-            continue
-        cursor.execute(
-            """
-            UPDATE paragraphs
-            SET event_time = ?, time_granularity = ?, time_confidence = ?, updated_at = ?
-            WHERE hash = ?
-            """,
-            (float(created_at), "day", 0.2, float(created_at), row["hash"]),
-        )
-        if cursor.rowcount > 0:
-            updated += 1
-
-    store._conn.commit()
+    summary = store.backfill_temporal_metadata_from_created_at(
+        limit=limit,
+        dry_run=dry_run,
+        no_created_fallback=no_created_fallback,
+    )
     store.close()
-    print(f"updated={updated}")
-    return updated
+    if dry_run:
+        print(f"[dry-run] candidates={summary['candidates']}")
+        return int(summary["candidates"])
+    if no_created_fallback:
+        print(f"skip update (no-created-fallback), candidates={summary['candidates']}")
+        return 0
+    print(f"updated={summary['updated']}")
+    return int(summary["updated"])
 
 
 def main() -> int:
