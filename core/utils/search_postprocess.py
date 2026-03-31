@@ -1,7 +1,5 @@
 """Post-processing helpers for unified search execution."""
 
-from __future__ import annotations
-
 from typing import Any, List, Tuple
 
 from .path_fallback_service import find_paths_from_query, to_retrieval_results

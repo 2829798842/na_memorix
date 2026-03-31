@@ -1,3 +1,4 @@
+"""提供插件模式下的 Web 可视化与管理服务。"""
 
 import asyncio
 import threading
@@ -17,61 +18,185 @@ from amemorix.settings import mask_sensitive
 logger = get_logger("A_Memorix.Server")
 
 class EdgeWeightUpdate(BaseModel):
+    """边权重更新请求。
+
+    Attributes:
+        source (str): 边起点。
+        target (str): 边终点。
+        weight (float): 新权重值。
+    """
+
     source: str
     target: str
     weight: float
 
 class NodeDelete(BaseModel):
+    """节点删除请求。
+
+    Attributes:
+        node_id (str): 待删除节点标识。
+    """
+
     node_id: str
 
 class EdgeDelete(BaseModel):
+    """边删除请求。
+
+    Attributes:
+        source (str): 边起点。
+        target (str): 边终点。
+    """
+
     source: str
     target: str
 
 class NodeCreate(BaseModel):
+    """节点创建请求。
+
+    Attributes:
+        node_id (str): 新节点标识。
+        label (Optional[str]): 节点展示名称。
+    """
+
     node_id: str
     label: Optional[str] = None
 
 class EdgeCreate(BaseModel):
+    """边创建请求。
+
+    Attributes:
+        source (str): 边起点。
+        target (str): 边终点。
+        weight (float): 初始边权重。
+        predicate (Optional[str]): 关系谓词。
+    """
+
     source: str
     target: str
     weight: float = 1.0
     predicate: Optional[str] = None
 
 class NodeRename(BaseModel):
+    """节点重命名请求。
+
+    Attributes:
+        old_id (str): 原节点标识。
+        new_id (str): 新节点标识。
+    """
+
     old_id: str
     new_id: str
 
 class AutoSaveConfig(BaseModel):
+    """自动保存开关请求。
+
+    Attributes:
+        enabled (bool): 是否启用自动保存。
+    """
+
     enabled: bool
 
+
+class ReindexRequest(BaseModel):
+    """重建索引请求。
+
+    Attributes:
+        batch_size (int): 重建索引时的批大小。
+    """
+
+    batch_size: int = 32
+
 class SourceListRequest(BaseModel):
+    """来源筛选请求。
+
+    Attributes:
+        node_id (Optional[str]): 节点标识。
+        edge_source (Optional[str]): 边起点。
+        edge_target (Optional[str]): 边终点。
+    """
+
     node_id: Optional[str] = None
     edge_source: Optional[str] = None
     edge_target: Optional[str] = None
 
 class SourceDeleteRequest(BaseModel):
+    """来源删除请求。
+
+    Attributes:
+        paragraph_hash (str): 待删除段落哈希值。
+    """
+
     paragraph_hash: str
 
 class BatchSourceDeleteRequest(BaseModel):
+    """批量来源删除请求。
+
+    Attributes:
+        source (str): 待清理的来源名称。
+    """
+
     source: str
 
 class PersonProfileQueryRequest(BaseModel):
+    """人物画像查询请求。
+
+    Attributes:
+        person_id (Optional[str]): 人物 ID。
+        person_keyword (Optional[str]): 人物关键字。
+        top_k (int): 证据条数上限。
+        force_refresh (bool): 是否强制刷新。
+    """
+
     person_id: Optional[str] = None
     person_keyword: Optional[str] = None
     top_k: int = 12
     force_refresh: bool = False
 
 class PersonProfileOverrideUpsertRequest(BaseModel):
+    """人物画像覆盖写入请求。
+
+    Attributes:
+        person_id (str): 人物 ID。
+        override_text (str): 覆盖文本。
+        updated_by (Optional[str]): 更新来源。
+    """
+
     person_id: str
     override_text: str
     updated_by: Optional[str] = None
 
 class PersonProfileOverrideDeleteRequest(BaseModel):
+    """人物画像覆盖删除请求。
+
+    Attributes:
+        person_id (str): 人物 ID。
+    """
+
     person_id: str
 
 class MemorixServer:
+    """封装插件 Web 服务与可视化接口。
+
+    Attributes:
+        plugin (Any): 插件实例。
+        host (str): 服务监听地址。
+        port (int): 服务监听端口。
+        app (FastAPI): FastAPI 应用实例。
+        server_thread (Optional[threading.Thread]): 后台服务线程。
+        _server (Optional[uvicorn.Server]): Uvicorn 服务实例。
+        should_exit (bool): 是否请求退出服务。
+        _relation_cache (Optional[Dict[str, Any]]): 关系缓存。
+        _relation_cache_timestamp (float): 关系缓存时间戳。
+    """
+
     def __init__(self, plugin_instance, host="0.0.0.0", port=8082):
+        """初始化 Web 服务并注册路由。
+
+        Args:
+            plugin_instance: 插件主实例。
+            host: 服务监听地址。
+            port: 服务监听端口。
+        """
         self.plugin = plugin_instance
         self.host = host
         self.port = port
@@ -81,7 +206,7 @@ class MemorixServer:
         self._server = None
         self.should_exit = False
         
-        # 缓存 relations predicate map
+        # 缓存关系谓词映射
         self._relation_cache = None
         self._relation_cache_timestamp = 0
         
@@ -101,6 +226,7 @@ class MemorixServer:
         self._setup_routes()
 
     def _setup_routes(self):
+        """注册 Web UI 与管理接口。"""
         def _build_person_profile_service():
             from core.utils.person_profile_service import PersonProfileService
 
@@ -112,6 +238,28 @@ class MemorixServer:
                 sparse_index=getattr(self.plugin, "sparse_index", None),
                 plugin_config=getattr(self.plugin, "config", {}) or {},
             )
+
+        async def _ensure_task_manager():
+            from .plugin import ensure_task_manager_started
+
+            return await ensure_task_manager_started()
+
+        async def _ensure_runtime():
+            from .plugin import ensure_runtime_ready
+
+            return await ensure_runtime_ready()
+
+        async def _run_sync(func, /, *args, **kwargs):
+            ctx = await _ensure_runtime()
+            return await ctx.run_blocking(func, *args, **kwargs)
+
+        def _get_task_manager():
+            from .plugin import get_task_manager
+
+            manager = get_task_manager()
+            if manager is None:
+                raise HTTPException(status_code=503, detail="Task manager not initialized")
+            return manager
 
         def _resolve_person_id_for_web(service, raw_value: str) -> str:
             value = str(raw_value or "").strip()
@@ -142,6 +290,23 @@ class MemorixServer:
                     if nick:
                         out.append(nick)
             return out
+
+        @self.app.middleware("http")
+        async def _runtime_middleware(request, call_next):
+            path = str(request.url.path or "")
+            if path.startswith("/api") and path not in {"/api/config"}:
+                await _ensure_runtime()
+            return await call_next(request)
+
+        @self.app.get("/healthz")
+        async def healthz():
+            return {"status": "ok"}
+
+        @self.app.get("/readyz")
+        async def readyz():
+            from .plugin import get_runtime_status
+
+            return get_runtime_status()
 
         
         @self.app.get("/api/graph")
@@ -564,13 +729,16 @@ class MemorixServer:
                 # 查看 GraphStore源码，update_edge_weight 是 add weight.
                 # 如果我们要 set weight，我们需要先获取当前权重。
                 
-                current_weight = self.plugin.graph_store.get_edge_weight(data.source, data.target)
-                delta = data.weight - current_weight
+                def _update():
+                    current_weight = self.plugin.graph_store.get_edge_weight(data.source, data.target)
                 
-                new_weight = self.plugin.graph_store.update_edge_weight(data.source, data.target, delta)
+                    delta = data.weight - current_weight
                 # 持久化保存到磁盘
-                self.plugin.graph_store.save()
-                return {"success": True, "new_weight": new_weight}
+                    new_weight = self.plugin.graph_store.update_edge_weight(data.source, data.target, delta)
+                    self.plugin.graph_store.save()
+                    return {"success": True, "new_weight": new_weight}
+
+                return await _run_sync(_update)
             except Exception as e:
                 logger.error(f"Update weight failed: {e}")
                 raise HTTPException(status_code=500, detail=str(e))
@@ -620,7 +788,6 @@ class MemorixServer:
         @self.app.post("/api/node")
         async def create_node(data: NodeCreate):
             """创建节点"""
-            print(f"DEBUG: graph_store={self.plugin.graph_store}")
             if self.plugin.graph_store is None:
                 raise HTTPException(status_code=503, detail="Graph store not initialized")
             
@@ -1171,11 +1338,12 @@ class MemorixServer:
                 raise HTTPException(status_code=503, detail="Metadata store not initialized")
             try:
                 service = _build_person_profile_service()
-                resolved_pid = _resolve_person_id_for_web(service, data.person_id)
+                resolved_pid = await _run_sync(_resolve_person_id_for_web, service, data.person_id)
                 if not resolved_pid:
                     raise HTTPException(status_code=400, detail="person_id 不能为空")
 
-                override = self.plugin.metadata_store.set_person_profile_override(
+                override = await _run_sync(
+                    self.plugin.metadata_store.set_person_profile_override,
                     person_id=resolved_pid,
                     override_text=str(data.override_text or ""),
                     updated_by=str(data.updated_by or "webui"),
@@ -1239,12 +1407,41 @@ class MemorixServer:
                 logger.error(f"Manual save failed: {e}")
                 raise HTTPException(status_code=500, detail=str(e))
 
+        @self.app.post("/api/reindex")
+        async def create_reindex_task(data: ReindexRequest):
+            try:
+                manager = await _ensure_task_manager()
+                task = await manager.enqueue_reindex_task(data.model_dump())
+                return {
+                    "task_id": task.get("task_id"),
+                    "status": task.get("status"),
+                    "created_at": task.get("created_at"),
+                }
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.error(f"Create reindex task failed: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @self.app.get("/api/reindex/{task_id}")
+        async def get_reindex_task(task_id: str):
+            manager = _get_task_manager()
+            task = manager.get_task(task_id)
+            if not task:
+                raise HTTPException(status_code=404, detail="Task not found")
+            return task
+
         @self.app.get("/api/config")
         async def get_config():
             """获取配置（脱敏只读）"""
             base_payload = {
                 "auto_save_enabled": self.plugin.get_config("advanced.enable_auto_save", True),
                 "auto_save_interval": self.plugin.get_config("advanced.auto_save_interval_minutes", 5),
+                "global_memory_enabled": self.plugin.get_config("memory.enabled", True),
+                "auto_inject_enabled": self.plugin.get_config("routing.auto_inject_enabled", True),
+                "web_read_only": self.plugin.get_config("web.read_only", False),
+                "embedding_model_group": self.plugin.get_config("embedding.model_group", ""),
+                "retrieval_top_k": self.plugin.get_config("retrieval.top_k_final", 10),
             }
             plugin_config = getattr(self.plugin, "config", None)
             if isinstance(plugin_config, dict):

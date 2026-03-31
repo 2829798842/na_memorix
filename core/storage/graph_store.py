@@ -77,6 +77,7 @@ class GraphStore:
         else:
             self.matrix_format = str(matrix_format).lower()
         self.data_dir = Path(data_dir) if data_dir else None
+        self._metadata_store = None
 
         # 节点管理
         self._nodes: List[str] = []  # 节点列表
@@ -106,6 +107,36 @@ class GraphStore:
         self._lock = asyncio.Lock()
 
         logger.info(f"GraphStore 初始化: format={matrix_format}")
+
+    def bind_metadata_store(self, metadata_store) -> None:
+        """绑定元数据存储，用于图快照读写与兼容迁移。
+
+        Args:
+            metadata_store: 元数据存储对象。
+        """
+        self._metadata_store = metadata_store
+
+    def _legacy_metadata_path(self, data_dir: Path) -> Path:
+        """返回旧版本图元数据文件路径。
+
+        Args:
+            data_dir: 图数据目录。
+
+        Returns:
+            Path: 旧版图元数据文件路径。
+        """
+        return data_dir / "graph_metadata.pkl"
+
+    def _legacy_matrix_path(self, data_dir: Path) -> Path:
+        """返回旧版本图邻接矩阵文件路径。
+
+        Args:
+            data_dir: 图数据目录。
+
+        Returns:
+            Path: 旧版图矩阵文件路径。
+        """
+        return data_dir / "graph_adjacency.npz"
 
     def _canonicalize(self, node: str) -> str:
         """规范化节点名称 (用于去重和内部索引)"""
@@ -1047,6 +1078,8 @@ class GraphStore:
         self._adjacency = None
         self._adjacency_T = None
         self._adjacency_dirty = True
+        self._saliency_cache = None
+        self._edge_hash_map = defaultdict(set)
         self._total_nodes_added = 0
         self._total_edges_added = 0
         self._total_nodes_deleted = 0
@@ -1289,6 +1322,11 @@ class GraphStore:
         return (self.data_dir / "graph_metadata.pkl").exists()
 
     def __repr__(self) -> str:
+        """返回图存储的调试摘要字符串。
+
+        Returns:
+            str: 包含节点数、边数、密度与矩阵格式的摘要。
+        """
         return (
             f"GraphStore(nodes={self.num_nodes}, edges={self.num_edges}, "
             f"density={self.density:.4f}, format={self.matrix_format})"
@@ -1326,4 +1364,205 @@ class GraphStore:
         logger.info(f"已从 {count} 条哈希重建边哈希映射，覆盖 {len(self._edge_hash_map)} 条边")
         return count
 
+    def _save_to_local_files(self, data_dir: Path) -> None:
+        """将当前图快照保存到旧版本本地文件。
 
+        Args:
+            data_dir: 图数据目录。
+        """
+        data_dir.mkdir(parents=True, exist_ok=True)
+
+        if self._adjacency is not None:
+            matrix_path = self._legacy_matrix_path(data_dir)
+            with atomic_write(matrix_path, "wb") as f:
+                save_npz(f, self._adjacency)
+
+        metadata = {
+            "nodes": self._nodes,
+            "node_to_idx": self._node_to_idx,
+            "node_attrs": self._node_attrs,
+            "matrix_format": self.matrix_format,
+            "total_nodes_added": self._total_nodes_added,
+            "total_edges_added": self._total_edges_added,
+            "total_nodes_deleted": self._total_nodes_deleted,
+            "total_edges_deleted": self._total_edges_deleted,
+            "edge_hash_map": dict(self._edge_hash_map),
+        }
+        metadata_path = self._legacy_metadata_path(data_dir)
+        with atomic_write(metadata_path, "wb") as f:
+            pickle.dump(metadata, f)
+
+    def _load_from_local_files(self, data_dir: Path) -> None:
+        """从旧版本本地文件恢复图快照。
+
+        Args:
+            data_dir: 图数据目录。
+
+        Raises:
+            FileNotFoundError: 当旧版图元数据文件不存在时抛出。
+        """
+        metadata_path = self._legacy_metadata_path(data_dir)
+        if not metadata_path.exists():
+            raise FileNotFoundError(f"graph metadata not found: {metadata_path}")
+
+        with metadata_path.open("rb") as f:
+            metadata = pickle.load(f)
+
+        self.clear()
+        self._nodes = list(metadata.get("nodes", []))
+        self._node_attrs = {}
+        self._node_to_idx = {}
+        for idx, node_name in enumerate(self._nodes):
+            canon = self._canonicalize(node_name)
+            if canon not in self._node_to_idx:
+                self._node_to_idx[canon] = idx
+            orig_attrs = metadata.get("node_attrs", {})
+            if node_name in orig_attrs and canon not in self._node_attrs:
+                self._node_attrs[canon] = orig_attrs[node_name]
+
+        self.matrix_format = metadata.get("matrix_format", self.matrix_format)
+        self._total_nodes_added = int(metadata.get("total_nodes_added", 0))
+        self._total_edges_added = int(metadata.get("total_edges_added", 0))
+        self._total_nodes_deleted = int(metadata.get("total_nodes_deleted", 0))
+        self._total_edges_deleted = int(metadata.get("total_edges_deleted", 0))
+        self._edge_hash_map = defaultdict(set)
+        for key, values in dict(metadata.get("edge_hash_map", {})).items():
+            self._edge_hash_map[key] = set(values)
+
+        matrix_path = self._legacy_matrix_path(data_dir)
+        if matrix_path.exists():
+            self._adjacency = load_npz(str(matrix_path))
+            if self.matrix_format == "csc" and isinstance(self._adjacency, csr_matrix):
+                self._adjacency = self._adjacency.tocsc()
+            elif self.matrix_format == "csr" and isinstance(self._adjacency, csc_matrix):
+                self._adjacency = self._adjacency.tocsr()
+
+        if self._adjacency is not None and len(self._nodes) > self._adjacency.shape[0]:
+            self._expand_adjacency_matrix(len(self._nodes) - self._adjacency.shape[0])
+
+        self._adjacency_dirty = True
+        self._saliency_cache = None
+
+    def _load_from_pg_snapshot(self, snapshot: Dict[str, List[Dict[str, Any]]]) -> None:
+        """从 PostgreSQL 图快照恢复内存中的图结构。
+
+        Args:
+            snapshot: 图节点与边的快照数据。
+        """
+        self.clear()
+
+        nodes = list(snapshot.get("nodes", []))
+        for node in nodes:
+            display_name = str(node.get("display_name") or node.get("canonical_id") or "")
+            canonical_id = self._canonicalize(str(node.get("canonical_id") or display_name))
+            if not canonical_id:
+                continue
+            self._nodes.append(display_name)
+            self._node_to_idx[canonical_id] = len(self._nodes) - 1
+            self._node_attrs[canonical_id] = dict(node.get("attrs") or {})
+
+        edge_rows: List[int] = []
+        edge_cols: List[int] = []
+        edge_vals: List[float] = []
+        self._edge_hash_map = defaultdict(set)
+        for edge in snapshot.get("edges", []):
+            source_canonical = self._canonicalize(str(edge.get("source_canonical") or edge.get("source_display") or ""))
+            target_canonical = self._canonicalize(str(edge.get("target_canonical") or edge.get("target_display") or ""))
+            if source_canonical not in self._node_to_idx or target_canonical not in self._node_to_idx:
+                continue
+            source_idx = self._node_to_idx[source_canonical]
+            target_idx = self._node_to_idx[target_canonical]
+            edge_rows.append(source_idx)
+            edge_cols.append(target_idx)
+            edge_vals.append(float(edge.get("weight") or 0.0))
+            self._edge_hash_map[(source_idx, target_idx)] = set(edge.get("relation_hashes") or [])
+
+        size = len(self._nodes)
+        if size > 0:
+            matrix_cls = csr_matrix if self.matrix_format == "csr" else csc_matrix
+            self._adjacency = matrix_cls((edge_vals, (edge_rows, edge_cols)), shape=(size, size), dtype=np.float32)
+        else:
+            self._adjacency = None
+
+        self._adjacency_dirty = True
+        self._saliency_cache = None
+        self._total_nodes_added = len(self._nodes)
+        self._total_edges_added = len(edge_vals)
+
+    def _legacy_save_unused(self, data_dir: Optional[Union[str, Path]] = None) -> None:
+        """兼容旧接口的图持久化实现。
+
+        Args:
+            data_dir: 可选图数据目录。
+        """
+        if self._metadata_store is not None:
+            nodes = []
+            for node_name in self._nodes:
+                canonical_id = self._canonicalize(node_name)
+                nodes.append(
+                    {
+                        "canonical_id": canonical_id,
+                        "display_name": node_name,
+                        "attrs": dict(self._node_attrs.get(canonical_id, {})),
+                    }
+                )
+
+            edges = []
+            if self._adjacency is not None:
+                coo = self._adjacency.tocoo()
+                for source_idx, target_idx, weight in zip(coo.row, coo.col, coo.data):
+                    if source_idx >= len(self._nodes) or target_idx >= len(self._nodes):
+                        continue
+                    source_display = self._nodes[int(source_idx)]
+                    target_display = self._nodes[int(target_idx)]
+                    edges.append(
+                        {
+                            "source_canonical": self._canonicalize(source_display),
+                            "target_canonical": self._canonicalize(target_display),
+                            "source_display": source_display,
+                            "target_display": target_display,
+                            "weight": float(weight),
+                            "relation_hashes": sorted(self._edge_hash_map.get((int(source_idx), int(target_idx)), set())),
+                        }
+                    )
+
+            self._metadata_store.save_graph_snapshot(nodes=nodes, edges=edges)
+            logger.info("GraphStore saved to PostgreSQL snapshot (%s nodes, %s edges)", len(nodes), len(edges))
+            return
+
+        if data_dir is None:
+            data_dir = self.data_dir
+        if data_dir is None:
+            raise ValueError("graph data_dir is required when metadata store is not bound")
+        self._save_to_local_files(Path(data_dir))
+
+    def _legacy_load_unused(self, data_dir: Optional[Union[str, Path]] = None) -> None:
+        """兼容旧接口的图加载实现。
+
+        Args:
+            data_dir: 可选图数据目录。
+        """
+        if self._metadata_store is not None and self._metadata_store.graph_has_data():
+            snapshot = self._metadata_store.load_graph_snapshot()
+            self._load_from_pg_snapshot(snapshot)
+            logger.info("GraphStore loaded from PostgreSQL snapshot (%s nodes, %s edges)", self.num_nodes, self.num_edges)
+            return
+
+        if data_dir is None:
+            data_dir = self.data_dir
+        if data_dir is None:
+            raise ValueError("graph data_dir is required when metadata store is not bound")
+        self._load_from_local_files(Path(data_dir))
+        logger.info("GraphStore loaded from legacy local files (%s nodes, %s edges)", self.num_nodes, self.num_edges)
+
+    def _legacy_has_data_unused(self) -> bool:
+        """判断图快照是否已存在。
+
+        Returns:
+            bool: PostgreSQL 快照或旧版本本地文件任一存在时返回 ``True``。
+        """
+        if self._metadata_store is not None and self._metadata_store.graph_has_data():
+            return True
+        if self.data_dir is None:
+            return False
+        return self._legacy_metadata_path(self.data_dir).exists()

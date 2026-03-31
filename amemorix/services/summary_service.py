@@ -1,7 +1,5 @@
 """Summary import service wrappers."""
 
-from __future__ import annotations
-
 from typing import Any, Dict, List
 
 from core.utils.summary_importer import SummaryImporter

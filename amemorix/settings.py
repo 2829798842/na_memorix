@@ -1,7 +1,5 @@
 """Configuration loading for standalone runtime."""
 
-from __future__ import annotations
-
 import copy
 import json
 import os
@@ -66,7 +64,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "time": {"skip_threshold_when_query_empty": True},
         "sparse": {
             "enabled": True,
-            "backend": "fts5",
+            "backend": "postgres",
             "lazy_load": True,
             "mode": "auto",
             "tokenizer_mode": "jieba",
@@ -140,7 +138,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "match_strategy": "contains",
         },
     },
-    "filter": {"enabled": True, "mode": "whitelist", "chats": []},
+    "filter": {"enabled": False, "mode": "whitelist", "chats": []},
     "routing": {
         "search_owner": "action",
         "tool_search_mode": "forward",
@@ -342,13 +340,6 @@ class AppSettings:
             with resolved_path.open("rb") as f:
                 parsed = tomllib.load(f)
             base = _deep_merge(base, parsed)
-        else:
-            default_path = Path.cwd() / "config.toml"
-            if default_path.exists():
-                resolved_path = default_path
-                with default_path.open("rb") as f:
-                    parsed = tomllib.load(f)
-                base = _deep_merge(base, parsed)
 
         resolved = _apply_env_overrides(base)
         logger.info(

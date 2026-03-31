@@ -4,10 +4,10 @@
 person_id -> 别名解析 -> 图谱证据 + 向量证据 -> 画像快照
 """
 
-from __future__ import annotations
-
+import asyncio
 import json
 import time
+from functools import partial
 from typing import Any, Dict, List, Optional, Tuple
 
 from amemorix.common.logging import get_logger
@@ -43,6 +43,11 @@ class PersonProfileService:
         self.sparse_index = sparse_index
         self.plugin_config = plugin_config or {}
         self.retriever = retriever or self._build_retriever()
+
+    async def _run_blocking(self, func, /, *args: Any, **kwargs: Any) -> Any:
+        """Run blocking store access on a worker thread."""
+
+        return await asyncio.to_thread(partial(func, *args, **kwargs))
 
     def _cfg(self, key: str, default: Any = None) -> Any:
         current: Any = self.plugin_config if isinstance(self.plugin_config, dict) else {}
@@ -361,13 +366,13 @@ class PersonProfileService:
     ) -> Dict[str, Any]:
         pid = str(person_id or "").strip()
         if not pid and person_keyword:
-            pid = self.resolve_person_id(person_keyword)
+            pid = await self._run_blocking(self.resolve_person_id, person_keyword)
         if not pid:
             return {"success": False, "error": "person_id 无效，且未能通过别名解析"}
 
-        latest = self.metadata_store.get_latest_person_profile_snapshot(pid)
+        latest = await self._run_blocking(self.metadata_store.get_latest_person_profile_snapshot, pid)
         if not force_refresh and not self._is_snapshot_stale(latest, ttl_seconds):
-            aliases, primary_name, _ = self.get_person_aliases(pid)
+            aliases, primary_name, _ = await self._run_blocking(self.get_person_aliases, pid)
             payload = {
                 "success": True,
                 "person_id": pid,
@@ -377,13 +382,13 @@ class PersonProfileService:
             }
             if aliases and not payload.get("aliases"):
                 payload["aliases"] = aliases
-            return self._apply_manual_override(pid, payload)
+            return await self._run_blocking(self._apply_manual_override, pid, payload)
 
-        aliases, primary_name, memory_traits = self.get_person_aliases(pid)
+        aliases, primary_name, memory_traits = await self._run_blocking(self.get_person_aliases, pid)
         if not aliases and person_keyword:
             aliases = [person_keyword.strip()]
             primary_name = person_keyword.strip()
-        relation_edges = self._collect_relation_evidence(aliases, limit=max(10, top_k * 2))
+        relation_edges = await self._run_blocking(self._collect_relation_evidence, aliases, max(10, top_k * 2))
         vector_evidence = await self._collect_vector_evidence(aliases, top_k=max(4, top_k))
 
         evidence_ids = [
@@ -409,7 +414,8 @@ class PersonProfileService:
         )
 
         expires_at = time.time() + float(ttl_seconds) if ttl_seconds > 0 else None
-        snapshot = self.metadata_store.upsert_person_profile_snapshot(
+        snapshot = await self._run_blocking(
+            self.metadata_store.upsert_person_profile_snapshot,
             person_id=pid,
             profile_text=profile_text,
             aliases=aliases,
@@ -426,7 +432,7 @@ class PersonProfileService:
             "from_cache": False,
             **snapshot,
         }
-        return self._apply_manual_override(pid, payload)
+        return await self._run_blocking(self._apply_manual_override, pid, payload)
 
     @staticmethod
     def format_persona_profile_block(profile: Dict[str, Any]) -> str:

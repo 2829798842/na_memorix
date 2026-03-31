@@ -1,7 +1,5 @@
 """Import orchestration service."""
 
-from __future__ import annotations
-
 import json
 import re
 from pathlib import Path
@@ -192,7 +190,7 @@ class ImportService:
             "hashes": hashes,
         }
 
-    async def import_file(self, path_str: str) -> Dict[str, Any]:
+    async def import_file(self, path_str: str, source_override: Optional[str] = None) -> Dict[str, Any]:
         path = Path(path_str).expanduser()
         if not path.is_absolute():
             path = (Path.cwd() / path).resolve()
@@ -200,8 +198,9 @@ class ImportService:
             raise FileNotFoundError(f"file not found: {path}")
 
         suffix = path.suffix.lower()
+        source_name = str(source_override or f"file:{path.name}")
         if suffix in {".txt", ".md"}:
-            return await self.import_text(text=path.read_text(encoding="utf-8"), source=f"file:{path.name}")
+            return await self.import_text(text=path.read_text(encoding="utf-8"), source=source_name)
         if suffix == ".json":
             return await self.import_json(path.read_text(encoding="utf-8"))
         raise ValueError(f"unsupported file suffix: {suffix}")

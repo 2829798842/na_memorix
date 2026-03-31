@@ -1,10 +1,9 @@
 """Application context and runtime shared state."""
 
-from __future__ import annotations
-
 import asyncio
 import time
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 
@@ -36,6 +35,7 @@ class AppContext:
     _request_dedup_cache: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     _request_dedup_inflight: Dict[str, asyncio.Future] = field(default_factory=dict)
     _request_dedup_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    _blocking_io_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     def get_config(self, key: str, default: Any = None) -> Any:
         current: Any = self.config
@@ -160,9 +160,15 @@ class AppContext:
         if not relation_hashes:
             return
         try:
-            self.metadata_store.reinforce_relations(relation_hashes)
+            await self.run_blocking(self.metadata_store.reinforce_relations, relation_hashes)
         except Exception as exc:
             logger.warning("Failed to reinforce relation access: %s", exc)
+
+    async def run_blocking(self, func: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
+        """Serialize blocking store access onto a worker thread."""
+
+        async with self._blocking_io_lock:
+            return await asyncio.to_thread(partial(func, *args, **kwargs))
 
     async def save_all(self) -> None:
         await asyncio.gather(

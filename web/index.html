@@ -173,6 +173,71 @@
         transform: scale(1.05);
       }
 
+      .plugin-status {
+        position: absolute;
+        top: 24px;
+        right: 24px;
+        z-index: 101;
+        display: flex;
+        gap: 10px;
+        align-items: center;
+        padding: 10px 14px;
+        border-radius: 14px;
+        background: var(--glass-bg);
+        border: 1px solid var(--glass-border);
+        backdrop-filter: blur(14px);
+        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
+      }
+
+      .plugin-status .status-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 6px 10px;
+        border-radius: 999px;
+        font-size: 0.72rem;
+        font-weight: 700;
+        letter-spacing: 0.03em;
+        background: rgba(255, 255, 255, 0.06);
+        color: var(--text-main);
+      }
+
+      .plugin-status .status-pill[data-state="on"] {
+        color: #06281c;
+        background: rgba(16, 185, 129, 0.88);
+      }
+
+      .plugin-status .status-pill[data-state="off"] {
+        color: #3a1111;
+        background: rgba(239, 68, 68, 0.88);
+      }
+
+      .plugin-status .status-pill[data-state="warn"] {
+        color: #3d2402;
+        background: rgba(245, 158, 11, 0.9);
+      }
+
+      .plugin-status .status-meta {
+        font-size: 0.75rem;
+        color: var(--text-dim);
+      }
+
+      .plugin-status .reindex-btn {
+        padding: 8px 12px;
+        border-radius: 999px;
+        border: 1px solid var(--glass-border);
+        background: rgba(255, 255, 255, 0.06);
+        color: var(--text-main);
+        cursor: pointer;
+        font-size: 0.75rem;
+        font-weight: 700;
+      }
+
+      .plugin-status .reindex-btn[disabled] {
+        opacity: 0.65;
+        cursor: not-allowed;
+      }
+
       /* Bottom Dock */
       .dock {
         position: absolute;
@@ -634,6 +699,14 @@
 
     <!-- Graph Surface -->
     <div id="container"></div>
+
+    <div class="plugin-status">
+      <div id="global-memory-pill" class="status-pill" data-state="warn">Memory: Checking</div>
+      <div id="auto-inject-pill" class="status-pill" data-state="warn">Inject: Checking</div>
+      <div id="plugin-status-meta" class="status-meta">Plugin config loading...</div>
+      <div id="reindex-status-meta" class="status-meta">Vectors: Idle</div>
+      <button id="reindex-button" class="reindex-btn" onclick="startReindex()">Reindex</button>
+    </div>
 
     <!-- Search Box -->
     <div class="search-container">
@@ -1305,6 +1378,16 @@
       let infoDensity = 0.5; // Shared state for saliency filtering
       let isSimulationRunning = true; // Physics simulation state
       let _freezeTimer = null;
+      let pluginConfigSnapshot = null;
+      let activeReindexTaskId = null;
+      let reindexPollTimer = null;
+
+      axios.interceptors.request.use((config) => {
+        if (config && typeof config.url === "string" && config.url.startsWith("/")) {
+          config.url = `.${config.url}`;
+        }
+        return config;
+      });
 
       // 加载控制 (Loading Control)
       function showLoader(text = "正在同步全景知识图谱...", isSync = false) {
@@ -1791,8 +1874,106 @@
       async function loadConfig() {
         try {
           const res = await axios.get("/api/config");
-          // We'll update state when manager panel opens
+          pluginConfigSnapshot = res.data || {};
+          renderPluginStatus(pluginConfigSnapshot);
         } catch (err) {}
+      }
+
+      function renderPluginStatus(config) {
+        const memoryPill = document.getElementById("global-memory-pill");
+        const injectPill = document.getElementById("auto-inject-pill");
+        const meta = document.getElementById("plugin-status-meta");
+        if (!memoryPill || !injectPill || !meta) return;
+
+        const globalEnabled = !!config.global_memory_enabled;
+        const injectEnabled = !!config.auto_inject_enabled;
+        const readOnly = !!config.web_read_only;
+        const modelGroup = config.embedding_model_group || "default";
+        const topK = config.retrieval_top_k ?? "-";
+
+        memoryPill.dataset.state = globalEnabled ? "on" : "off";
+        memoryPill.textContent = globalEnabled ? "Memory: ON" : "Memory: OFF";
+
+        injectPill.dataset.state = globalEnabled
+          ? injectEnabled
+            ? "on"
+            : "warn"
+          : "off";
+        injectPill.textContent = globalEnabled
+          ? injectEnabled
+            ? "Inject: ON"
+            : "Inject: OFF"
+          : "Inject: Disabled";
+
+        meta.textContent = `Model: ${modelGroup} | Top-K: ${topK}${readOnly ? " | Read only" : ""}`;
+      }
+
+      function renderReindexTask(task) {
+        const meta = document.getElementById("reindex-status-meta");
+        const button = document.getElementById("reindex-button");
+        if (!meta || !button) return;
+
+        if (!task || !task.task_id) {
+          meta.textContent = "Vectors: Idle";
+          button.disabled = false;
+          button.textContent = "Reindex";
+          return;
+        }
+
+        const status = String(task.status || "queued");
+        const labelMap = {
+          queued: "Queued",
+          running: "Running",
+          succeeded: "Done",
+          failed: "Failed",
+          canceled: "Canceled",
+        };
+        const label = labelMap[status] || status;
+        meta.textContent = `Vectors: ${label} (${String(task.task_id).slice(0, 8)})`;
+        button.disabled = status === "queued" || status === "running";
+        button.textContent = button.disabled ? "Reindexing..." : "Reindex";
+      }
+
+      async function pollReindexTask(taskId) {
+        if (!taskId) return;
+        activeReindexTaskId = taskId;
+        if (reindexPollTimer) {
+          clearTimeout(reindexPollTimer);
+          reindexPollTimer = null;
+        }
+
+        try {
+          const res = await axios.get(`/api/reindex/${encodeURIComponent(taskId)}`);
+          const task = res.data || {};
+          renderReindexTask(task);
+          const status = String(task.status || "");
+          if (status === "queued" || status === "running") {
+            reindexPollTimer = setTimeout(() => pollReindexTask(taskId), 1500);
+          }
+        } catch (err) {
+          renderReindexTask(null);
+        }
+      }
+
+      async function startReindex() {
+        const button = document.getElementById("reindex-button");
+        if (button) {
+          button.disabled = true;
+          button.textContent = "Reindexing...";
+        }
+        try {
+          const res = await axios.post("/api/reindex", { batch_size: 32 });
+          const task = res.data || {};
+          activeReindexTaskId = task.task_id || null;
+          showToast(`向量重建任务已提交: ${String(task.task_id || "").slice(0, 8)}`);
+          renderReindexTask(task);
+          if (activeReindexTaskId) {
+            await pollReindexTask(activeReindexTaskId);
+          }
+        } catch (err) {
+          renderReindexTask(null);
+          showToast("向量重建启动失败");
+        }
       }
 
       function toggleDetailedMode() {

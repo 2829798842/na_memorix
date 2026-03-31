@@ -1,7 +1,5 @@
 """Person profile API orchestration service."""
 
-from __future__ import annotations
-
 from typing import Any, Dict, Optional
 
 from amemorix.context import AppContext
@@ -31,10 +29,12 @@ class PersonProfileApiService:
         )
 
     async def set_override(self, *, person_id: str, override_text: str, updated_by: str = "v1") -> Dict[str, Any]:
-        pid = self.ctx.person_profile_service.resolve_person_id(person_id) or str(person_id or "").strip()
+        pid = await self.ctx.run_blocking(self.ctx.person_profile_service.resolve_person_id, person_id)
+        pid = pid or str(person_id or "").strip()
         if not pid:
             raise ValueError("person_id is empty")
-        override = self.ctx.metadata_store.set_person_profile_override(
+        override = await self.ctx.run_blocking(
+            self.ctx.metadata_store.set_person_profile_override,
             person_id=pid,
             override_text=str(override_text or ""),
             updated_by=str(updated_by or "v1"),
@@ -44,14 +44,16 @@ class PersonProfileApiService:
         return {"success": True, "person_id": pid, "override": override, "profile": profile}
 
     async def delete_override(self, *, person_id: str) -> Dict[str, Any]:
-        pid = self.ctx.person_profile_service.resolve_person_id(person_id) or str(person_id or "").strip()
+        pid = await self.ctx.run_blocking(self.ctx.person_profile_service.resolve_person_id, person_id)
+        pid = pid or str(person_id or "").strip()
         if not pid:
             raise ValueError("person_id is empty")
-        deleted = self.ctx.metadata_store.delete_person_profile_override(pid)
+        deleted = await self.ctx.run_blocking(self.ctx.metadata_store.delete_person_profile_override, pid)
         return {"success": True, "person_id": pid, "deleted": bool(deleted)}
 
     async def upsert_registry(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        return self.ctx.metadata_store.upsert_person_registry(
+        return await self.ctx.run_blocking(
+            self.ctx.metadata_store.upsert_person_registry,
             person_id=str(payload.get("person_id", "")).strip(),
             person_name=str(payload.get("person_name", "")).strip(),
             nickname=str(payload.get("nickname", "")).strip(),
@@ -68,5 +70,10 @@ class PersonProfileApiService:
         max_size = int(self.ctx.get_config("person_profile.registry.page_size_max", 100))
         size = page_size if page_size is not None else default_size
         size = max(1, min(max_size, int(size)))
-        return self.ctx.metadata_store.list_person_registry(keyword=keyword, page=page, page_size=size)
+        return await self.ctx.run_blocking(
+            self.ctx.metadata_store.list_person_registry,
+            keyword=keyword,
+            page=page,
+            page_size=size,
+        )
 

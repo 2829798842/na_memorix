@@ -1,7 +1,5 @@
 """Bearer token auth middleware."""
 
-from __future__ import annotations
-
 from typing import Iterable, Optional, Set
 
 from fastapi import Request

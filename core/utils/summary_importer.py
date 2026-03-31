@@ -2,8 +2,6 @@
 聊天总结与知识导入工具（独立版）。
 """
 
-from __future__ import annotations
-
 import json
 import time
 from typing import Any, Dict, List, Optional, Tuple

@@ -1,7 +1,5 @@
 """Query orchestration service."""
 
-from __future__ import annotations
-
 from typing import Any, Dict, Optional
 
 from core.utils.search_execution_service import (
@@ -102,44 +100,54 @@ class QueryService:
         target = str(entity_name or "").strip()
         if not target:
             raise ValueError("entity_name is empty")
-        if not self.ctx.graph_store.has_node(target):
-            raise ValueError(f"entity not found: {target}")
-        neighbors = self.ctx.graph_store.get_neighbors(target)
-        paragraphs = self.ctx.metadata_store.get_paragraphs_by_entity(target)
-        relations = (
-            self.ctx.metadata_store.get_relations(subject=target)
-            + self.ctx.metadata_store.get_relations(object=target)
-        )
-        return {
-            "entity_name": target,
-            "neighbors": neighbors,
-            "paragraphs": paragraphs,
-            "relations": relations,
-        }
+
+        def _collect() -> Dict[str, Any]:
+            if not self.ctx.graph_store.has_node(target):
+                raise ValueError(f"entity not found: {target}")
+            neighbors = self.ctx.graph_store.get_neighbors(target)
+            paragraphs = self.ctx.metadata_store.get_paragraphs_by_entity(target)
+            relations = (
+                self.ctx.metadata_store.get_relations(subject=target)
+                + self.ctx.metadata_store.get_relations(object=target)
+            )
+            return {
+                "entity_name": target,
+                "neighbors": neighbors,
+                "paragraphs": paragraphs,
+                "relations": relations,
+            }
+
+        return await self.ctx.run_blocking(_collect)
 
     async def relation(self, *, subject: str = "", predicate: str = "", obj: str = "") -> Dict[str, Any]:
-        rels = self.ctx.metadata_store.get_relations(
-            subject=subject or None,
-            predicate=predicate or None,
-            object=obj or None,
-        )
-        return {
-            "subject": subject,
-            "predicate": predicate,
-            "object": obj,
-            "count": len(rels),
-            "relations": rels,
-        }
+        def _collect() -> Dict[str, Any]:
+            rels = self.ctx.metadata_store.get_relations(
+                subject=subject or None,
+                predicate=predicate or None,
+                object=obj or None,
+            )
+            return {
+                "subject": subject,
+                "predicate": predicate,
+                "object": obj,
+                "count": len(rels),
+                "relations": rels,
+            }
+
+        return await self.ctx.run_blocking(_collect)
 
     async def stats(self) -> Dict[str, Any]:
-        vector_stats = {"num_vectors": self.ctx.vector_store.num_vectors, "dimension": self.ctx.vector_store.dimension}
-        graph_stats = {"num_nodes": self.ctx.graph_store.num_nodes, "num_edges": self.ctx.graph_store.num_edges}
-        metadata_stats = self.ctx.metadata_store.get_statistics()
-        return {
-            "vector_store": vector_stats,
-            "graph_store": graph_stats,
-            "metadata_store": metadata_stats,
-            "retriever": self.ctx.retriever.get_statistics(),
-            "sparse": self.ctx.sparse_index.stats() if self.ctx.sparse_index is not None else None,
-        }
+        def _collect() -> Dict[str, Any]:
+            vector_stats = {"num_vectors": self.ctx.vector_store.num_vectors, "dimension": self.ctx.vector_store.dimension}
+            graph_stats = {"num_nodes": self.ctx.graph_store.num_nodes, "num_edges": self.ctx.graph_store.num_edges}
+            metadata_stats = self.ctx.metadata_store.get_statistics()
+            return {
+                "vector_store": vector_stats,
+                "graph_store": graph_stats,
+                "metadata_store": metadata_stats,
+                "retriever": self.ctx.retriever.get_statistics(),
+                "sparse": self.ctx.sparse_index.stats() if self.ctx.sparse_index is not None else None,
+            }
+
+        return await self.ctx.run_blocking(_collect)
 

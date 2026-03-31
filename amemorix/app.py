@@ -1,7 +1,5 @@
 """FastAPI app factory for standalone runtime."""
 
-from __future__ import annotations
-
 from fastapi import FastAPI
 
 from server import MemorixServer

@@ -1,9 +1,6 @@
-"""Bootstrap standalone runtime components."""
-
-from __future__ import annotations
+"""构建 na_memorix 运行时上下文并衔接外部基础设施。"""
 
 import asyncio
-import pickle
 from pathlib import Path
 from typing import Any, Dict
 
@@ -13,6 +10,9 @@ from core.retrieval.sparse_bm25 import SparseBM25Config, SparseBM25Index
 from core.retrieval.threshold import DynamicThresholdFilter, ThresholdConfig, ThresholdMethod
 from core.storage import GraphStore, MetadataStore, QuantizationType, SparseMatrixFormat, VectorStore
 from core.utils.person_profile_service import PersonProfileService
+from qdrant_client import QdrantClient
+
+from nekro_agent.core.vector_db import get_qdrant_config
 
 from .common.logging import get_logger
 from .context import AppContext
@@ -22,6 +22,15 @@ logger = get_logger("A_Memorix.Bootstrap")
 
 
 def _safe_int(value: Any, default: int) -> int:
+    """将任意值安全转换为整数。
+
+    Args:
+        value: 待转换的原始值。
+        default: 转换失败时回退的默认值。
+
+    Returns:
+        int: 转换结果或默认值。
+    """
     try:
         return int(value)
     except (TypeError, ValueError):
@@ -29,32 +38,61 @@ def _safe_int(value: Any, default: int) -> int:
 
 
 def _safe_float(value: Any, default: float) -> float:
+    """将任意值安全转换为浮点数。
+
+    Args:
+        value: 待转换的原始值。
+        default: 转换失败时回退的默认值。
+
+    Returns:
+        float: 转换结果或默认值。
+    """
     try:
         return float(value)
     except (TypeError, ValueError):
         return default
 
 
-def _resolve_vector_dimension(settings: AppSettings, vectors_dir: Path) -> int:
-    metadata_path = vectors_dir / "vectors_metadata.pkl"
-    if metadata_path.exists():
-        try:
-            with metadata_path.open("rb") as f:
-                data = pickle.load(f)
-            dim = _safe_int(data.get("dimension"), 0)
-            if dim > 0:
-                return dim
-        except Exception as exc:
-            logger.warning("Failed to read existing vector metadata dimension: %s", exc)
-    return _safe_int(settings.get("embedding.dimension", 1024), 1024)
+def _resolve_existing_qdrant_dimension(*collection_names: str) -> int:
+    """从现有 Qdrant 集合中探测已落地的向量维度。
+
+    Args:
+        *collection_names: 按优先级检查的集合名称。
+
+    Returns:
+        int: 找到的维度值；若未找到则返回 ``0``。
+    """
+    cfg = get_qdrant_config()
+    client = QdrantClient(url=cfg.url, api_key=cfg.api_key, timeout=15.0)
+    try:
+        for collection_name in collection_names:
+            if not str(collection_name or "").strip():
+                continue
+            try:
+                collection = client.get_collection(collection_name)
+            except Exception:
+                continue
+            params = getattr(collection.config, "params", None)
+            vectors = getattr(params, "vectors", None)
+            size = getattr(vectors, "size", None)
+            if size:
+                return int(size)
+    finally:
+        close = getattr(client, "close", None)
+        if callable(close):
+            close()
+    return 0
 
 
 def _probe_embedding_dimension(adapter: Any, fallback_dim: int) -> int:
-    """
-    Probe real embedding dimension from remote endpoint.
+    """向远端嵌入接口探测真实维度。
 
-    Only used for fresh stores (no existing vector metadata), so we can
-    auto-align vector store dimension with provider output.
+    Args:
+        adapter: 负责发起嵌入请求的适配器对象。
+        fallback_dim: 探测失败时使用的默认维度。
+
+    Returns:
+        int: 探测成功后的真实维度，或回退维度。
     """
     try:
         detected = int(asyncio.run(adapter._detect_dimension()))  # noqa: SLF001
@@ -65,7 +103,42 @@ def _probe_embedding_dimension(adapter: Any, fallback_dim: int) -> int:
     return int(fallback_dim)
 
 
+def _rebuild_graph_from_relations(graph_store: GraphStore, metadata_store: MetadataStore) -> int:
+    """根据关系表内容重建图缓存。
+
+    Args:
+        graph_store: 需要重建的图存储对象。
+        metadata_store: 提供三元组数据的元数据存储对象。
+
+    Returns:
+        int: 成功回灌到图中的关系数量。
+    """
+    triples = metadata_store.get_all_triples()
+    if not triples:
+        return 0
+
+    graph_store.clear()
+    nodes = sorted({str(subject) for subject, _, _, _ in triples} | {str(obj) for _, _, obj, _ in triples})
+    if nodes:
+        graph_store.add_nodes(nodes)
+    graph_store.add_edges(
+        [(str(subject), str(obj)) for subject, _, obj, _ in triples],
+        weights=[1.0] * len(triples),
+        relation_hashes=[str(hash_value) for _, _, _, hash_value in triples],
+    )
+    graph_store.save()
+    return len(triples)
+
+
 def build_context(settings: AppSettings) -> AppContext:
+    """根据应用配置组装完整运行时上下文。
+
+    Args:
+        settings: 应用级配置对象。
+
+    Returns:
+        AppContext: 包含存储、检索、嵌入与服务对象的运行时上下文。
+    """
     data_dir = settings.data_dir
     vectors_dir = data_dir / "vectors"
     graph_dir = data_dir / "graph"
@@ -77,11 +150,15 @@ def build_context(settings: AppSettings) -> AppContext:
 
     endpoint_cfg = resolve_openapi_endpoint_config(settings.config, section="embedding")
     retry_cfg = settings.get("embedding.retry", {}) or {}
-    configured_dim = _resolve_vector_dimension(settings, vectors_dir)
+    chunk_collection = str(settings.get("qdrant.chunk_collection", "na_memorix_chunks") or "na_memorix_chunks")
+    relation_collection = str(settings.get("qdrant.relation_collection", "na_memorix_relations") or "na_memorix_relations")
+    configured_dim = _safe_int(settings.get("embedding.dimension", 1024), 1024)
+    existing_dim = _resolve_existing_qdrant_dimension(chunk_collection, relation_collection)
+    initial_dim = existing_dim or configured_dim
     adapter = create_embedding_api_adapter(
         batch_size=_safe_int(settings.get("embedding.batch_size", 32), 32),
         max_concurrent=_safe_int(settings.get("embedding.max_concurrent", 5), 5),
-        default_dimension=configured_dim,
+        default_dimension=initial_dim,
         model_name=str(settings.get("embedding.model_name", "auto")),
         retry_config=retry_cfg,
         base_url=str(endpoint_cfg.get("base_url", "")),
@@ -91,10 +168,10 @@ def build_context(settings: AppSettings) -> AppContext:
         max_retries=_safe_int(endpoint_cfg.get("max_retries", 3), 3),
     )
 
-    metadata_path = vectors_dir / "vectors_metadata.pkl"
-    vector_dim = configured_dim
+    vector_dim = initial_dim
     auto_detect = bool(settings.get("embedding.auto_detect_dimension", True))
-    if auto_detect and not metadata_path.exists():
+    if auto_detect and existing_dim <= 0:
+        # 新库优先向远端探测维度，避免配置值与服务端真实输出不一致。
         probed_dim = _probe_embedding_dimension(adapter, configured_dim)
         if probed_dim != configured_dim:
             logger.info(
@@ -114,13 +191,6 @@ def build_context(settings: AppSettings) -> AppContext:
         QuantizationType.INT8,
     )
 
-    vector_store = VectorStore(
-        dimension=vector_dim,
-        quantization_type=quantization_type,
-        data_dir=vectors_dir,
-    )
-    vector_store.min_train_threshold = _safe_int(settings.get("embedding.min_train_threshold", 40), 40)
-
     matrix_format_map = {
         "csr": SparseMatrixFormat.CSR,
         "csc": SparseMatrixFormat.CSC,
@@ -130,8 +200,19 @@ def build_context(settings: AppSettings) -> AppContext:
         SparseMatrixFormat.CSR,
     )
     graph_store = GraphStore(matrix_format=matrix_format, data_dir=graph_dir)
-    metadata_store = MetadataStore(data_dir=metadata_dir)
+    table_prefix = str(settings.get("storage.table_prefix", "na_memorix") or "na_memorix").strip() or "na_memorix"
+    metadata_store = MetadataStore(data_dir=metadata_dir, table_prefix=table_prefix)
     metadata_store.connect()
+    graph_store.bind_metadata_store(metadata_store)
+    vector_store = VectorStore(
+        dimension=vector_dim,
+        quantization_type=quantization_type,
+        data_dir=vectors_dir,
+        metadata_store=metadata_store,
+        chunk_collection=chunk_collection,
+        relation_collection=relation_collection,
+    )
+    vector_store.min_train_threshold = _safe_int(settings.get("embedding.min_train_threshold", 40), 40)
 
     sparse_index = None
     sparse_raw = settings.get("retrieval.sparse", {}) or {}
@@ -150,14 +231,27 @@ def build_context(settings: AppSettings) -> AppContext:
         except Exception as exc:
             logger.warning("Vector load failed: %s", exc)
 
-    if graph_store.has_data():
+    graph_pg_exists = metadata_store.graph_has_data()
+    legacy_graph_exists = (graph_dir / "graph_metadata.pkl").exists()
+    if graph_pg_exists or legacy_graph_exists:
         try:
             graph_store.load()
+            if not graph_pg_exists and legacy_graph_exists:
+                # 发现旧版本地图库时，首次加载后立即回写到 PostgreSQL 快照表。
+                graph_store.save()
+                logger.info("Migrated legacy graph cache into PostgreSQL graph tables")
             logger.info("Loaded graph store with %s nodes", graph_store.num_nodes)
         except Exception as exc:
             logger.warning("Graph load failed: %s", exc)
+    else:
+        try:
+            # 没有图快照时，直接从关系表回放，保证新部署可立即查询图结构。
+            rebuilt = _rebuild_graph_from_relations(graph_store, metadata_store)
+            if rebuilt:
+                logger.info("Rebuilt graph store from relation metadata: %s edges", rebuilt)
+        except Exception as exc:
+            logger.warning("Graph rebuild from relations skipped: %s", exc)
 
-    # Compatibility migration: rebuild edge-hash map when absent.
     try:
         if not getattr(graph_store, "_edge_hash_map", {}):
             triples = metadata_store.get_all_triples()

@@ -1,6 +1,4 @@
-"""Background task manager for import/summary and maintenance loops."""
-
-from __future__ import annotations
+"""统一调度导入、摘要、重建索引与维护任务。"""
 
 import asyncio
 import datetime
@@ -26,7 +24,28 @@ TASK_STATUS_CANCELED = "canceled"
 
 
 class TaskManager:
+    """管理后台任务队列与周期维护协程。
+
+    Attributes:
+        ctx (AppContext): 共享运行时上下文。
+        import_service (ImportService): 导入任务服务。
+        summary_service (SummaryService): 摘要任务服务。
+        memory_service (MemoryService): 记忆维护服务。
+        person_service (PersonProfileApiService): 人物画像服务。
+        import_queue (asyncio.Queue[Tuple[str, Dict[str, Any]]]): 导入任务队列。
+        summary_queue (asyncio.Queue[Tuple[str, Dict[str, Any]]]): 摘要任务队列。
+        reindex_queue (asyncio.Queue[Tuple[str, Dict[str, Any]]]): 重建索引任务队列。
+        _workers (List[asyncio.Task]): 已启动的后台工作协程。
+        _stopping (bool): 是否处于停止流程中。
+        _reindex_enqueue_lock (asyncio.Lock): 保证重建索引任务串行入队的锁。
+    """
+
     def __init__(self, ctx: AppContext):
+        """初始化任务管理器及其队列。
+
+        Args:
+            ctx: 共享运行时上下文。
+        """
         self.ctx = ctx
         self.import_service = ImportService(ctx)
         self.summary_service = SummaryService(ctx)
@@ -36,10 +55,13 @@ class TaskManager:
         queue_maxsize = int(self.ctx.get_config("tasks.queue_maxsize", 1024))
         self.import_queue: asyncio.Queue[Tuple[str, Dict[str, Any]]] = asyncio.Queue(maxsize=max(1, queue_maxsize))
         self.summary_queue: asyncio.Queue[Tuple[str, Dict[str, Any]]] = asyncio.Queue(maxsize=max(1, queue_maxsize))
+        self.reindex_queue: asyncio.Queue[Tuple[str, Dict[str, Any]]] = asyncio.Queue(maxsize=1)
         self._workers: List[asyncio.Task] = []
         self._stopping = False
+        self._reindex_enqueue_lock = asyncio.Lock()
 
     async def start(self) -> None:
+        """启动任务工作协程与周期维护循环。"""
         self._stopping = False
         import_workers = max(1, int(self.ctx.get_config("tasks.import_workers", 1)))
         summary_workers = max(1, int(self.ctx.get_config("tasks.summary_workers", 1)))
@@ -48,6 +70,7 @@ class TaskManager:
             self._workers.append(asyncio.create_task(self._import_worker(idx), name=f"import-worker-{idx}"))
         for idx in range(summary_workers):
             self._workers.append(asyncio.create_task(self._summary_worker(idx), name=f"summary-worker-{idx}"))
+        self._workers.append(asyncio.create_task(self._reindex_worker(0), name="reindex-worker-0"))
 
         self._workers.append(asyncio.create_task(self._auto_save_loop(), name="auto-save-loop"))
         self._workers.append(asyncio.create_task(self._memory_maintenance_loop(), name="memory-maint-loop"))
@@ -55,6 +78,7 @@ class TaskManager:
         logger.info("TaskManager started with %s workers", len(self._workers))
 
     async def stop(self) -> None:
+        """停止全部后台任务并等待协程退出。"""
         self._stopping = True
         for task in self._workers:
             task.cancel()
@@ -64,21 +88,84 @@ class TaskManager:
         logger.info("TaskManager stopped")
 
     async def enqueue_import_task(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """创建并排队一个导入任务。
+
+        Args:
+            payload: 导入任务的请求参数。
+
+        Returns:
+            Dict[str, Any]: 创建后的任务记录。
+        """
         task_id = uuid.uuid4().hex
         task = self.ctx.metadata_store.create_async_task(task_id=task_id, task_type="import", payload=payload)
         await self.import_queue.put((task_id, payload))
         return task
 
     async def enqueue_summary_task(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """创建并排队一个摘要任务。
+
+        Args:
+            payload: 摘要任务的请求参数。
+
+        Returns:
+            Dict[str, Any]: 创建后的任务记录。
+        """
         task_id = uuid.uuid4().hex
         task = self.ctx.metadata_store.create_async_task(task_id=task_id, task_type="summary", payload=payload)
         await self.summary_queue.put((task_id, payload))
         return task
 
+    async def enqueue_reindex_task(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """创建并排队一个重建向量索引任务。
+
+        Args:
+            payload: 重建任务的可选参数。
+
+        Returns:
+            Dict[str, Any]: 已存在的活跃任务或新建任务记录。
+        """
+        async with self._reindex_enqueue_lock:
+            active = self._find_active_task("reindex")
+            if active is not None:
+                return active
+
+            task_id = uuid.uuid4().hex
+            task_payload = dict(payload or {})
+            task = self.ctx.metadata_store.create_async_task(task_id=task_id, task_type="reindex", payload=task_payload)
+            await self.reindex_queue.put((task_id, task_payload))
+            return task
+
     def get_task(self, task_id: str) -> Optional[Dict[str, Any]]:
+        """按任务 ID 查询任务详情。
+
+        Args:
+            task_id: 任务唯一标识。
+
+        Returns:
+            Optional[Dict[str, Any]]: 命中的任务记录；不存在时返回 ``None``。
+        """
         return self.ctx.metadata_store.get_async_task(task_id)
 
+    def _find_active_task(self, task_type: str) -> Optional[Dict[str, Any]]:
+        """查找指定类型仍在排队或执行中的任务。
+
+        Args:
+            task_type: 任务类型。
+
+        Returns:
+            Optional[Dict[str, Any]]: 首个活跃任务记录；不存在时返回 ``None``。
+        """
+        for item in self.ctx.metadata_store.list_async_tasks(task_type=task_type, limit=20):
+            if str(item.get("status") or "") in {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING}:
+                return item
+        return None
+
     async def _import_worker(self, worker_idx: int) -> None:
+        """循环消费导入任务队列。
+
+        Args:
+            worker_idx: 工作协程编号。
+        """
         while not self._stopping:
             task_id = ""
             try:
@@ -90,7 +177,6 @@ class TaskManager:
                         status=TASK_STATUS_CANCELED,
                         finished_at=datetime.datetime.now().timestamp(),
                     )
-                    self.import_queue.task_done()
                     continue
 
                 now = datetime.datetime.now().timestamp()
@@ -121,6 +207,11 @@ class TaskManager:
                     self.import_queue.task_done()
 
     async def _summary_worker(self, worker_idx: int) -> None:
+        """循环消费摘要任务队列。
+
+        Args:
+            worker_idx: 工作协程编号。
+        """
         while not self._stopping:
             task_id = ""
             try:
@@ -132,7 +223,6 @@ class TaskManager:
                         status=TASK_STATUS_CANCELED,
                         finished_at=datetime.datetime.now().timestamp(),
                     )
-                    self.summary_queue.task_done()
                     continue
 
                 self.ctx.metadata_store.update_async_task(
@@ -175,7 +265,68 @@ class TaskManager:
                 if task_id:
                     self.summary_queue.task_done()
 
+    async def _reindex_worker(self, worker_idx: int) -> None:
+        """串行执行重建索引任务。
+
+        Args:
+            worker_idx: 工作协程编号，占位以保持工作协程签名一致。
+        """
+        del worker_idx
+        while not self._stopping:
+            task_id = ""
+            try:
+                task_id, payload = await self.reindex_queue.get()
+                existing = self.ctx.metadata_store.get_async_task(task_id)
+                if existing and existing.get("cancel_requested"):
+                    self.ctx.metadata_store.update_async_task(
+                        task_id=task_id,
+                        status=TASK_STATUS_CANCELED,
+                        finished_at=datetime.datetime.now().timestamp(),
+                    )
+                    continue
+
+                started_at = datetime.datetime.now().timestamp()
+                self.ctx.metadata_store.update_async_task(
+                    task_id=task_id,
+                    status=TASK_STATUS_RUNNING,
+                    started_at=started_at,
+                )
+                batch_size = max(1, int((payload or {}).get("batch_size", 32)))
+                await asyncio.to_thread(
+                    self.ctx.vector_store.rebuild_index,
+                    embedding_manager=self.ctx.embedding_manager,
+                    batch_size=batch_size,
+                )
+                result = {
+                    "success": True,
+                    "batch_size": batch_size,
+                    "paragraph_count": self.ctx.metadata_store.count_paragraphs(),
+                    "relation_count": self.ctx.metadata_store.count_relations(),
+                    "vector_count": int(self.ctx.vector_store.num_vectors),
+                }
+                self.ctx.metadata_store.update_async_task(
+                    task_id=task_id,
+                    status=TASK_STATUS_SUCCEEDED,
+                    result=result,
+                    finished_at=datetime.datetime.now().timestamp(),
+                )
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                if task_id:
+                    self.ctx.metadata_store.update_async_task(
+                        task_id=task_id,
+                        status=TASK_STATUS_FAILED,
+                        error_message=str(exc),
+                        finished_at=datetime.datetime.now().timestamp(),
+                    )
+                logger.error("Reindex worker failed task %s: %s", task_id, exc, exc_info=True)
+            finally:
+                if task_id:
+                    self.reindex_queue.task_done()
+
     async def _auto_save_loop(self) -> None:
+        """按配置周期触发全量持久化。"""
         while not self._stopping:
             try:
                 interval_min = float(self.ctx.get_config("advanced.auto_save_interval_minutes", 5))
@@ -188,6 +339,7 @@ class TaskManager:
                 logger.warning("Auto-save loop error: %s", exc)
 
     async def _memory_maintenance_loop(self) -> None:
+        """周期执行记忆衰减、冻结与关系裁剪。"""
         while not self._stopping:
             try:
                 interval_h = float(self.ctx.get_config("memory.base_decay_interval_hours", 1.0))
@@ -249,6 +401,7 @@ class TaskManager:
                 logger.warning("Memory maintenance loop error: %s", exc, exc_info=True)
 
     async def _person_profile_refresh_loop(self) -> None:
+        """周期刷新活跃人物画像快照。"""
         while not self._stopping:
             try:
                 interval_min = int(self.ctx.get_config("person_profile.refresh_interval_minutes", 30))
