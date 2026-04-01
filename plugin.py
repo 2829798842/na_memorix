@@ -45,6 +45,20 @@ plugin = NekroPlugin(
     sleep_brief="用于长期记忆检索、图谱知识导入与当前聊天上下文的自动记忆注入。",
 )
 
+_WEB_PANEL_ROOT = f"/plugins/{plugin.key}/"
+_WEB_PANEL_LINKS_ZH = (
+    f"界面入口："
+    f"<a href='{_WEB_PANEL_ROOT}' target='_blank' rel='noopener noreferrer'>打开主面板</a> / "
+    f"<a href='{_WEB_PANEL_ROOT}import' target='_blank' rel='noopener noreferrer'>打开导入中心</a> / "
+    f"<a href='{_WEB_PANEL_ROOT}tuning' target='_blank' rel='noopener noreferrer'>打开检索调优</a>"
+)
+_WEB_PANEL_LINKS_EN = (
+    f"Panel entry: "
+    f"<a href='{_WEB_PANEL_ROOT}' target='_blank' rel='noopener noreferrer'>Open Main Panel</a> / "
+    f"<a href='{_WEB_PANEL_ROOT}import' target='_blank' rel='noopener noreferrer'>Open Import Center</a> / "
+    f"<a href='{_WEB_PANEL_ROOT}tuning' target='_blank' rel='noopener noreferrer'>Open Retrieval Tuning</a>"
+)
+
 
 def _config_extra(
     *,
@@ -276,8 +290,14 @@ class NaMemorixConfig(ConfigBase):
         category_en="Web Panel",
         title_zh="Web 面板只读模式",
         title_en="Web Panel Read-only Mode",
-        description_zh="启用后，前端面板仅允许查看记忆数据，禁止写入和修改操作。",
-        description_en="When enabled, the web panel becomes read-only and disallows write or edit operations.",
+        description_zh=(
+            "启用后，前端面板仅允许查看记忆数据，禁止写入和修改操作。<br/>"
+            f"{_WEB_PANEL_LINKS_ZH}"
+        ),
+        description_en=(
+            "When enabled, the web panel becomes read-only and disallows write or edit operations.<br/>"
+            f"{_WEB_PANEL_LINKS_EN}"
+        ),
     )
     TOP_K_PARAGRAPHS: int = _config_field(
         20,
@@ -794,11 +814,29 @@ async def ensure_task_manager_started() -> Any:
     return manager
 
 
+def _extract_compat_api_path(path: str) -> Optional[str]:
+    """从挂载后的请求路径中提取兼容层 `/api` 子路径。"""
+
+    normalized = str(path or "").strip()
+    if not normalized:
+        return None
+
+    marker = "/api"
+    marker_index = normalized.find(marker)
+    if marker_index < 0:
+        return None
+
+    compat_path = normalized[marker_index:]
+    if compat_path == marker or compat_path.startswith(f"{marker}/"):
+        return compat_path
+    return None
+
+
 async def _compat_runtime_dependency(request: Request) -> AsyncIterator[None]:
     """为兼容层 `/api/*` 路由施加请求级 runtime 绑定。"""
 
-    path = str(request.url.path or "")
-    if not path.startswith("/api") or path == "/api/config":
+    compat_path = _extract_compat_api_path(str(request.url.path or ""))
+    if compat_path is None or compat_path == "/api/config":
         yield
         return
 

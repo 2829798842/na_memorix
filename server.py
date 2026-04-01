@@ -1,15 +1,15 @@
 """提供插件模式下的 Web 可视化与管理服务。"""
 
 import asyncio
-import threading
 import json
-import uvicorn
-from fastapi import FastAPI, HTTPException, Body, Query
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, FileResponse
-from fastapi.staticfiles import StaticFiles
+import threading
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Any, Dict, List, Optional
+
+import uvicorn
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from amemorix.common.logging import get_logger
@@ -227,6 +227,49 @@ class MemorixServer:
 
     def _setup_routes(self):
         """注册 Web UI 与管理接口。"""
+
+        def _build_web_runtime_script(request: Request) -> str:
+            plugin_root = str(request.url_for("memorix_web_index")).rstrip("/")
+            runtime_payload = {
+                "pluginRoot": plugin_root,
+                "apiRoot": f"{plugin_root}/api",
+            }
+            runtime_json = json.dumps(runtime_payload, ensure_ascii=False)
+            return f"""
+<script>
+  (() => {{
+    const runtime = Object.freeze({runtime_json});
+    window.__NA_MEMORIX_WEB__ = runtime;
+    window.__NA_MEMORIX_PLUGIN_ROOT__ = runtime.pluginRoot;
+    window.apiUrl = function(path = "") {{
+      const rawPath = String(path || "");
+      if (/^https?:\\/\\//.test(rawPath)) {{
+        return rawPath;
+      }}
+      const normalized = rawPath.replace(/^\\/+/, "");
+      const apiRelativePath = normalized.replace(/^api\\/?/, "");
+      return apiRelativePath ? `${{runtime.apiRoot}}/${{apiRelativePath}}` : runtime.apiRoot;
+    }};
+    window.pageUrl = function(page = "") {{
+      const normalized = String(page || "").replace(/^\\/+|\\/+$/g, "");
+      return normalized ? `${{runtime.pluginRoot}}/${{normalized}}` : `${{runtime.pluginRoot}}/`;
+    }};
+  }})();
+</script>
+""".strip()
+
+        def _serve_web_page(file_name: str, request: Request) -> HTMLResponse:
+            html_path = Path(__file__).parent / "web" / file_name
+            if html_path.exists():
+                html_content = html_path.read_text(encoding="utf-8")
+                runtime_script = _build_web_runtime_script(request)
+                if "</head>" in html_content:
+                    html_content = html_content.replace("</head>", f"{runtime_script}\n</head>", 1)
+                else:
+                    html_content = f"{runtime_script}\n{html_content}"
+                return HTMLResponse(content=html_content)
+            return HTMLResponse(content="<h1>UI Not Found</h1>", status_code=404)
+
         def _build_person_profile_service():
             from core.utils.person_profile_service import PersonProfileService
 
@@ -293,8 +336,10 @@ class MemorixServer:
 
         @self.app.middleware("http")
         async def _runtime_middleware(request, call_next):
-            path = str(request.url.path or "")
-            if path.startswith("/api") and path not in {"/api/config"}:
+            from .plugin import _extract_compat_api_path
+
+            compat_path = _extract_compat_api_path(str(request.url.path or ""))
+            if compat_path is not None and compat_path not in {"/api/config"}:
                 await _ensure_runtime()
             return await call_next(request)
 
@@ -1448,6 +1493,27 @@ class MemorixServer:
                 base_payload["config"] = mask_sensitive(plugin_config)
             return base_payload
 
+        @self.app.get("/api/ui_capabilities")
+        async def get_ui_capabilities():
+            """返回当前 Web 面板的能力接入情况。"""
+            return {
+                "pages": {
+                    "index": True,
+                    "import": True,
+                    "tuning": True,
+                },
+                "features": {
+                    "compat_graph_ui": True,
+                    "import_backend": False,
+                    "retrieval_tuning_backend": False,
+                },
+                "messages": {
+                    "import_backend": "已完成宿主适配，导入中心功能后端暂未接入。",
+                    "retrieval_tuning_backend": "已完成宿主适配，检索调优功能后端暂未接入。",
+                },
+                "web_read_only": bool(self.plugin.get_config("web.read_only", False)),
+            }
+
         @self.app.post("/api/config/auto_save")
         async def set_auto_save(data: AutoSaveConfig):
             """设置自动保存开关（仅运行时生效）"""
@@ -1455,13 +1521,20 @@ class MemorixServer:
             logger.info(f"自动保存已{'启用' if data.enabled else '禁用'}（运行时）")
             return {"success": True, "auto_save_enabled": data.enabled}
 
-        @self.app.get("/")
-        async def index():
+        @self.app.get("/", name="memorix_web_index")
+        async def index(request: Request):
             """返回主页"""
-            html_path = Path(__file__).parent / "web" / "index.html"
-            if html_path.exists():
-                return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
-            return HTMLResponse(content="<h1>UI Not Found</h1>")
+            return _serve_web_page("index.html", request)
+
+        @self.app.get("/import", name="memorix_web_import")
+        async def import_page(request: Request):
+            """返回导入中心页面。"""
+            return _serve_web_page("import.html", request)
+
+        @self.app.get("/tuning", name="memorix_web_tuning")
+        async def tuning_page(request: Request):
+            """返回检索调优页面。"""
+            return _serve_web_page("tuning.html", request)
 
     def run(self):
         """运行服务器 (阻塞)"""

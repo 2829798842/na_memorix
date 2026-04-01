@@ -12,6 +12,12 @@
 - 提供 Web 可视化界面，用于浏览图谱、查看来源、管理记忆和触发重建索引。
 - 暴露兼容的 `/api/*` 与 `/v1/*` 接口，便于前端和旧调用链继续工作。
 
+## Web 界面入口
+
+- [打开主面板](/plugins/litroenade.na_memorix/)
+- [打开导入中心](/plugins/litroenade.na_memorix/import)
+- [打开检索调优](/plugins/litroenade.na_memorix/tuning)
+
 ### 存储后端
 
 - 元数据后端：PostgreSQL

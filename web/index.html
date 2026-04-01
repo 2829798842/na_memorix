@@ -1367,6 +1367,9 @@
     <div id="toast">操作成功</div>
 
     <script>
+      const apiUrl = window.apiUrl;
+      const pageUrl = window.pageUrl;
+
       let network = null;
       let nodes = new vis.DataSet([]);
       let edges = new vis.DataSet([]);
@@ -1383,8 +1386,8 @@
       let reindexPollTimer = null;
 
       axios.interceptors.request.use((config) => {
-        if (config && typeof config.url === "string" && config.url.startsWith("/")) {
-          config.url = `.${config.url}`;
+        if (config && typeof config.url === "string" && !/^https?:\/\//.test(config.url)) {
+          config.url = apiUrl(config.url);
         }
         return config;
       });
