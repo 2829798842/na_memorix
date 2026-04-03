@@ -1,0 +1,507 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>na_memorix | 统一入口页</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&display=swap"
+      rel="stylesheet"
+    />
+    <style>
+      :root {
+        --bg: #07111f;
+        --panel: rgba(9, 20, 37, 0.72);
+        --panel-strong: rgba(9, 20, 37, 0.9);
+        --border: rgba(125, 211, 252, 0.18);
+        --text: #e0f2fe;
+        --muted: #93c5fd;
+        --accent: #38bdf8;
+        --accent-2: #22d3ee;
+        --ok: #34d399;
+        --warn: #fbbf24;
+        --danger: #fb7185;
+        --shadow: 0 24px 80px rgba(2, 6, 23, 0.45);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        color: var(--text);
+        font-family: "Space Grotesk", "Segoe UI", "Microsoft YaHei", sans-serif;
+        background:
+          radial-gradient(circle at top left, rgba(34, 211, 238, 0.18), transparent 30%),
+          radial-gradient(circle at 85% 15%, rgba(59, 130, 246, 0.16), transparent 28%),
+          radial-gradient(circle at bottom right, rgba(251, 191, 36, 0.14), transparent 24%),
+          linear-gradient(160deg, #020617 0%, #07111f 52%, #0b1730 100%);
+      }
+
+      body::before {
+        content: "";
+        position: fixed;
+        inset: 0;
+        pointer-events: none;
+        background-image:
+          linear-gradient(rgba(148, 163, 184, 0.05) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(148, 163, 184, 0.05) 1px, transparent 1px);
+        background-size: 28px 28px;
+        mask-image: radial-gradient(circle at center, black 30%, transparent 85%);
+      }
+
+      .shell {
+        width: min(1160px, calc(100vw - 32px));
+        margin: 0 auto;
+        padding: 28px 0 40px;
+      }
+
+      .hero {
+        position: relative;
+        overflow: hidden;
+        padding: 28px;
+        border-radius: 28px;
+        border: 1px solid var(--border);
+        background:
+          linear-gradient(140deg, rgba(8, 15, 30, 0.94), rgba(9, 20, 37, 0.78)),
+          var(--panel);
+        box-shadow: var(--shadow);
+        backdrop-filter: blur(16px);
+      }
+
+      .hero::after {
+        content: "";
+        position: absolute;
+        inset: auto -80px -100px auto;
+        width: 320px;
+        height: 320px;
+        border-radius: 999px;
+        background: radial-gradient(circle, rgba(34, 211, 238, 0.25), transparent 65%);
+      }
+
+      .eyebrow {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 14px;
+        border-radius: 999px;
+        background: rgba(56, 189, 248, 0.12);
+        color: var(--accent);
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+      }
+
+      h1 {
+        margin: 18px 0 10px;
+        font-size: clamp(34px, 5vw, 56px);
+        line-height: 0.98;
+      }
+
+      .hero p {
+        max-width: 760px;
+        margin: 0;
+        color: var(--muted);
+        font-size: 15px;
+        line-height: 1.7;
+      }
+
+      .status-grid {
+        margin-top: 22px;
+        display: grid;
+        gap: 12px;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+      }
+
+      .status-card {
+        padding: 16px 18px;
+        border-radius: 20px;
+        border: 1px solid rgba(148, 163, 184, 0.12);
+        background: rgba(15, 23, 42, 0.62);
+      }
+
+      .status-k {
+        color: var(--muted);
+        font-size: 12px;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+      }
+
+      .status-v {
+        margin-top: 8px;
+        font-size: 20px;
+        font-weight: 700;
+      }
+
+      .cards {
+        margin-top: 20px;
+        display: grid;
+        gap: 16px;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+      }
+
+      .card {
+        position: relative;
+        overflow: hidden;
+        min-height: 320px;
+        padding: 22px;
+        border-radius: 24px;
+        border: 1px solid var(--border);
+        background:
+          linear-gradient(180deg, rgba(10, 20, 38, 0.95), rgba(8, 15, 29, 0.82)),
+          var(--panel-strong);
+        box-shadow: var(--shadow);
+      }
+
+      .card::before {
+        content: "";
+        position: absolute;
+        inset: auto -56px -72px auto;
+        width: 180px;
+        height: 180px;
+        border-radius: 999px;
+        background: radial-gradient(circle, var(--glow, rgba(56, 189, 248, 0.22)), transparent 70%);
+      }
+
+      .card-head {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 12px;
+      }
+
+      .card-index {
+        color: rgba(224, 242, 254, 0.28);
+        font-size: 42px;
+        font-weight: 700;
+        line-height: 1;
+      }
+
+      .card-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 6px 10px;
+        border-radius: 999px;
+        font-size: 12px;
+        font-weight: 700;
+      }
+
+      .badge-ready {
+        background: rgba(52, 211, 153, 0.16);
+        color: #6ee7b7;
+      }
+
+      .badge-pending {
+        background: rgba(251, 191, 36, 0.16);
+        color: #fde68a;
+      }
+
+      .badge-readonly {
+        background: rgba(251, 113, 133, 0.16);
+        color: #fda4af;
+      }
+
+      .card h2 {
+        margin: 22px 0 10px;
+        font-size: 28px;
+      }
+
+      .card p {
+        margin: 0;
+        color: var(--muted);
+        line-height: 1.72;
+        font-size: 14px;
+      }
+
+      .meta-list {
+        margin: 18px 0 0;
+        padding: 0;
+        list-style: none;
+        display: grid;
+        gap: 10px;
+      }
+
+      .meta-item {
+        display: flex;
+        align-items: flex-start;
+        gap: 8px;
+        color: #cbd5e1;
+        font-size: 13px;
+        line-height: 1.5;
+      }
+
+      .meta-dot {
+        flex: 0 0 auto;
+        width: 8px;
+        height: 8px;
+        margin-top: 6px;
+        border-radius: 999px;
+        background: var(--accent);
+      }
+
+      .card-actions {
+        margin-top: 22px;
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+      }
+
+      .btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 116px;
+        padding: 11px 16px;
+        border-radius: 999px;
+        border: 1px solid transparent;
+        font-weight: 700;
+        text-decoration: none;
+        cursor: pointer;
+        transition: transform 0.2s ease, opacity 0.2s ease, border-color 0.2s ease;
+      }
+
+      .btn:hover {
+        transform: translateY(-1px);
+        opacity: 0.95;
+      }
+
+      .btn-primary {
+        background: linear-gradient(135deg, var(--accent), var(--accent-2));
+        color: #04131d;
+      }
+
+      .btn-secondary {
+        color: var(--text);
+        border-color: rgba(125, 211, 252, 0.24);
+        background: rgba(15, 23, 42, 0.62);
+      }
+
+      .footer-note {
+        margin-top: 18px;
+        padding: 16px 18px;
+        border-radius: 18px;
+        border: 1px solid rgba(148, 163, 184, 0.12);
+        background: rgba(10, 18, 32, 0.7);
+        color: var(--muted);
+        line-height: 1.65;
+        font-size: 14px;
+      }
+
+      @media (max-width: 980px) {
+        .status-grid,
+        .cards {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero">
+        <div class="eyebrow">na_memorix launcher</div>
+        <h1>三个界面的统一入口</h1>
+        <p>
+          这里负责把主面板、导入中心、检索调优收拢到同一个选择页里。页面只做导航和状态汇总，不会绕过宿主权限，也不会修改你现有的访问边界。
+        </p>
+        <div class="status-grid">
+          <article class="status-card">
+            <div class="status-k">全局记忆</div>
+            <div class="status-v" id="status-memory">加载中</div>
+          </article>
+          <article class="status-card">
+            <div class="status-k">自动注入</div>
+            <div class="status-v" id="status-inject">加载中</div>
+          </article>
+          <article class="status-card">
+            <div class="status-k">Web 面板</div>
+            <div class="status-v" id="status-web-mode">加载中</div>
+          </article>
+          <article class="status-card">
+            <div class="status-k">Embedding 模型组</div>
+            <div class="status-v" id="status-model">加载中</div>
+          </article>
+        </div>
+      </section>
+
+      <section class="cards" id="cards"></section>
+
+      <section class="footer-note" id="footer-note">
+        正在读取界面能力信息...
+      </section>
+    </main>
+
+    <script>
+      const apiUrl = window.apiUrl;
+      const pageUrl = window.pageUrl;
+
+      const state = {
+        config: null,
+        capabilities: null,
+      };
+
+      const PAGES = [
+        {
+          id: "01",
+          slug: "",
+          title: "知识全景图",
+          desc: "图谱检视、节点编辑、人物画像、回收站与重建索引等能力都在这里。",
+          items: ["兼容层 API 已接入", "当前是三个界面里接入最完整的一页", "适合直接作为主工作台使用"],
+          featureKey: null,
+          pageKey: "index",
+          glow: "rgba(34, 211, 238, 0.24)",
+        },
+        {
+          id: "02",
+          slug: "import",
+          title: "导入中心",
+          desc: "负责上传、粘贴、本地扫描与迁移任务的统一入口，适合集中处理导入相关动作。",
+          items: ["前端路由已适配插件路径", "是否可执行任务取决于 import_backend 能力旗标", "即使后端未接入也可以先查看界面"],
+          featureKey: "import_backend",
+          pageKey: "import",
+          glow: "rgba(56, 189, 248, 0.22)",
+        },
+        {
+          id: "03",
+          slug: "tuning",
+          title: "检索调优",
+          desc: "集中放运行时参数、调优任务和报告预览，适合做召回与排序参数观察。",
+          items: ["前端路由已适配插件路径", "是否可执行任务取决于 retrieval_tuning_backend 能力旗标", "可先作为调优工作台壳页面使用"],
+          featureKey: "retrieval_tuning_backend",
+          pageKey: "tuning",
+          glow: "rgba(251, 191, 36, 0.2)",
+        },
+      ];
+
+      function req(path) {
+        return fetch(apiUrl(path), { credentials: "same-origin" }).then(async (resp) => {
+          const body = await resp.json().catch(() => ({}));
+          if (!resp.ok) {
+            throw new Error(body.detail || `HTTP ${resp.status}`);
+          }
+          return body;
+        });
+      }
+
+      function capabilityState(featureKey) {
+        if (!featureKey) {
+          return { label: "已接入", cls: "badge-ready" };
+        }
+        if (state.capabilities?.features?.[featureKey]) {
+          return { label: "后端已接入", cls: "badge-ready" };
+        }
+        return { label: "仅前端壳", cls: "badge-pending" };
+      }
+
+      function webModeState() {
+        return state.config?.web_read_only
+          ? { label: "只读模式", cls: "badge-readonly" }
+          : { label: "可写模式", cls: "badge-ready" };
+      }
+
+      function openPage(slug, newTab = false) {
+        const url = pageUrl(slug);
+        if (newTab) {
+          window.open(url, "_blank", "noopener,noreferrer");
+          return;
+        }
+        window.location.href = url;
+      }
+
+      function renderStatus() {
+        const config = state.config || {};
+        document.getElementById("status-memory").textContent = config.global_memory_enabled ? "已开启" : "已关闭";
+        document.getElementById("status-inject").textContent = config.auto_inject_enabled ? "已开启" : "已关闭";
+        document.getElementById("status-web-mode").textContent = config.web_read_only ? "只读" : "可写";
+        document.getElementById("status-model").textContent = config.embedding_model_group || "未配置";
+      }
+
+      function renderCards() {
+        const cards = document.getElementById("cards");
+        cards.innerHTML = PAGES.map((page) => {
+          const capability = capabilityState(page.featureKey);
+          const webMode = webModeState();
+          const modeBadge = page.slug === "" ? `<span class="card-badge ${webMode.cls}">${webMode.label}</span>` : "";
+          const pageAvailable = state.capabilities?.pages?.[page.pageKey] !== false;
+          const unavailableNote = pageAvailable
+            ? ""
+            : `<li class="meta-item"><span class="meta-dot"></span><span>当前宿主未暴露该页面路由</span></li>`;
+
+          return `
+            <article class="card" style="--glow:${page.glow};">
+              <div class="card-head">
+                <div class="card-index">${page.id}</div>
+                <div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end;">
+                  <span class="card-badge ${capability.cls}">${capability.label}</span>
+                  ${modeBadge}
+                </div>
+              </div>
+              <h2>${page.title}</h2>
+              <p>${page.desc}</p>
+              <ul class="meta-list">
+                ${page.items
+                  .map(
+                    (item) =>
+                      `<li class="meta-item"><span class="meta-dot"></span><span>${item}</span></li>`,
+                  )
+                  .join("")}
+                ${unavailableNote}
+              </ul>
+              <div class="card-actions">
+                <button class="btn btn-primary" type="button" onclick="openPage('${page.slug}', false)">进入界面</button>
+                <button class="btn btn-secondary" type="button" onclick="openPage('${page.slug}', true)">新标签打开</button>
+              </div>
+            </article>
+          `;
+        }).join("");
+      }
+
+      function renderFooter() {
+        const caps = state.capabilities || {};
+        const messages = caps.messages || {};
+        const parts = [
+          "入口页已经适配插件注入路径，后续你只要继续补宿主前端扩展点或后端桥接，就能在这里统一汇总三个工作台。",
+        ];
+        if (messages.import_backend) {
+          parts.push(`导入中心：${messages.import_backend}`);
+        }
+        if (messages.retrieval_tuning_backend) {
+          parts.push(`检索调优：${messages.retrieval_tuning_backend}`);
+        }
+        document.getElementById("footer-note").textContent = parts.join(" ");
+      }
+
+      async function loadState() {
+        try {
+          const [config, capabilities] = await Promise.all([
+            req("/api/config").catch(() => ({})),
+            req("/api/ui_capabilities").catch(() => ({
+              pages: { launcher: true, index: true, import: true, tuning: true },
+              features: { import_backend: false, retrieval_tuning_backend: false },
+            })),
+          ]);
+          state.config = config;
+          state.capabilities = capabilities;
+        } catch (err) {
+          state.config = {};
+          state.capabilities = {
+            pages: { launcher: true, index: true, import: true, tuning: true },
+            features: { import_backend: false, retrieval_tuning_backend: false },
+          };
+          document.getElementById("footer-note").textContent = `状态读取失败：${err.message}`;
+        }
+
+        renderStatus();
+        renderCards();
+        renderFooter();
+      }
+
+      loadState();
+    </script>
+  </body>
+</html>

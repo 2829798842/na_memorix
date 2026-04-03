@@ -9,6 +9,7 @@ import sys
 from contextlib import asynccontextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, AsyncIterator, Literal, Optional
 
 from fastapi import APIRouter, Depends, Request
@@ -32,7 +33,7 @@ plugin = NekroPlugin(
     description="A_Memorix-style memory graph plugin",
     version="0.1.0",
     author="litroenade",
-    url="https://github.com/2829798842/na_memorix",
+    url="",
     i18n_name=i18n.i18n_text(
         zh_CN="na_memorix 记忆图谱",
         en_US="na_memorix Memory Graph",
@@ -45,18 +46,53 @@ plugin = NekroPlugin(
     sleep_brief="用于长期记忆检索、图谱知识导入与当前聊天上下文的自动记忆注入。",
 )
 
+_PROJECT_REPO_URL = "https://github.com/2829798842/na_memorix"
 _WEB_PANEL_ROOT = f"/plugins/{plugin.key}/"
+_WEB_PANEL_LAUNCHER = f"{_WEB_PANEL_ROOT}launcher"
+plugin.url = _WEB_PANEL_LAUNCHER
+_WEB_PANEL_LINK_STYLE_PRIMARY = (
+    "display:inline-flex;align-items:center;justify-content:center;"
+    "padding:6px 12px;border-radius:999px;text-decoration:none;"
+    "font-weight:700;background:linear-gradient(135deg,#0ea5e9,#22d3ee);"
+    "color:#03131d;"
+)
+_WEB_PANEL_LINK_STYLE_SECONDARY = (
+    "display:inline-flex;align-items:center;justify-content:center;"
+    "padding:6px 12px;border-radius:999px;text-decoration:none;"
+    "font-weight:600;border:1px solid rgba(14,165,233,0.35);"
+    "color:#38bdf8;"
+)
+
+
+def _panel_link(label: str, href: str, *, primary: bool = False) -> str:
+    """生成配置提示里使用的入口链接按钮。"""
+
+    style = _WEB_PANEL_LINK_STYLE_PRIMARY if primary else _WEB_PANEL_LINK_STYLE_SECONDARY
+    return (
+        f"<a href='{href}' target='_blank' rel='noopener noreferrer' style='{style}'>"
+        f"{label}</a>"
+    )
+
+
 _WEB_PANEL_LINKS_ZH = (
-    f"界面入口："
-    f"<a href='{_WEB_PANEL_ROOT}' target='_blank' rel='noopener noreferrer'>打开主面板</a> / "
-    f"<a href='{_WEB_PANEL_ROOT}import' target='_blank' rel='noopener noreferrer'>打开导入中心</a> / "
-    f"<a href='{_WEB_PANEL_ROOT}tuning' target='_blank' rel='noopener noreferrer'>打开检索调优</a>"
+    "界面入口："
+    "<div style='display:flex;flex-wrap:wrap;gap:8px;margin-top:8px;'>"
+    f"{_panel_link('打开入口页', _WEB_PANEL_LAUNCHER, primary=True)}"
+    f"{_panel_link('主面板', _WEB_PANEL_ROOT)}"
+    f"{_panel_link('导入中心', f'{_WEB_PANEL_ROOT}import')}"
+    f"{_panel_link('检索调优', f'{_WEB_PANEL_ROOT}tuning')}"
+    f"{_panel_link('项目仓库', _PROJECT_REPO_URL)}"
+    "</div>"
 )
 _WEB_PANEL_LINKS_EN = (
-    f"Panel entry: "
-    f"<a href='{_WEB_PANEL_ROOT}' target='_blank' rel='noopener noreferrer'>Open Main Panel</a> / "
-    f"<a href='{_WEB_PANEL_ROOT}import' target='_blank' rel='noopener noreferrer'>Open Import Center</a> / "
-    f"<a href='{_WEB_PANEL_ROOT}tuning' target='_blank' rel='noopener noreferrer'>Open Retrieval Tuning</a>"
+    "Panel entry: "
+    "<div style='display:flex;flex-wrap:wrap;gap:8px;margin-top:8px;'>"
+    f"{_panel_link('Open Launcher', _WEB_PANEL_LAUNCHER, primary=True)}"
+    f"{_panel_link('Main Panel', _WEB_PANEL_ROOT)}"
+    f"{_panel_link('Import Center', f'{_WEB_PANEL_ROOT}import')}"
+    f"{_panel_link('Retrieval Tuning', f'{_WEB_PANEL_ROOT}tuning')}"
+    f"{_panel_link('Repository', _PROJECT_REPO_URL)}"
+    "</div>"
 )
 
 
@@ -942,6 +978,35 @@ class RuntimeProxy:
 
 runtime_proxy = RuntimeProxy()
 
+_PLUGIN_PACKAGE_DIR = Path(__file__).resolve().parent
+
+
+def _module_belongs_to_plugin_dir(module: Any) -> bool:
+    """判断模块对象是否来自当前插件目录。"""
+
+    file_path = getattr(module, "__file__", None)
+    if not file_path:
+        return False
+    try:
+        return Path(file_path).resolve().is_relative_to(_PLUGIN_PACKAGE_DIR)
+    except Exception:
+        return False
+
+
+def _purge_plugin_module_cache() -> None:
+    """主动清理插件模块缓存，确保宿主热重载能吃到新代码。"""
+
+    package_prefix = f"{__package__}."
+    stale_modules = [name for name in list(sys.modules) if name == __package__ or name.startswith(package_prefix)]
+
+    for alias_prefix in ("amemorix", "core"):
+        for name, module in list(sys.modules.items()):
+            if (name == alias_prefix or name.startswith(f"{alias_prefix}.")) and _module_belongs_to_plugin_dir(module):
+                stale_modules.append(name)
+
+    for name in sorted(set(stale_modules), reverse=True):
+        sys.modules.pop(name, None)
+
 
 @plugin.mount_router()
 def create_router() -> APIRouter:
@@ -1111,3 +1176,4 @@ async def _cleanup_plugin():
         _runtime_handle = None
 
     await _retire_runtime_handle(handle)
+    _purge_plugin_module_cache()

@@ -1498,6 +1498,7 @@ class MemorixServer:
             """返回当前 Web 面板的能力接入情况。"""
             return {
                 "pages": {
+                    "launcher": True,
                     "index": True,
                     "import": True,
                     "tuning": True,
@@ -1525,6 +1526,11 @@ class MemorixServer:
         async def index(request: Request):
             """返回主页"""
             return _serve_web_page("index.html", request)
+
+        @self.app.get("/launcher", name="memorix_web_launcher")
+        async def launcher_page(request: Request):
+            """返回统一入口页。"""
+            return _serve_web_page("launcher.html", request)
 
         @self.app.get("/import", name="memorix_web_import")
         async def import_page(request: Request):
