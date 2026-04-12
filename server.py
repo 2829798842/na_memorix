@@ -334,6 +334,16 @@ class MemorixServer:
                         out.append(nick)
             return out
 
+        def _web_read_only_enabled() -> bool:
+            return bool(self.plugin.get_config("web.read_only", False))
+
+        def _ensure_web_write_allowed(action: str) -> None:
+            if _web_read_only_enabled():
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"Web 面板当前处于只读模式，禁止{action}",
+                )
+
         @self.app.middleware("http")
         async def _runtime_middleware(request, call_next):
             from .plugin import _extract_compat_api_path
@@ -767,6 +777,7 @@ class MemorixServer:
             """更新边权重"""
             if self.plugin.graph_store is None:
                 raise HTTPException(status_code=503, detail="Graph store not initialized")
+            _ensure_web_write_allowed("修改关系权重")
             
             try:
                 # 计算增量 (因为 update_edge_weight 是基于增量的)
@@ -793,6 +804,7 @@ class MemorixServer:
             """删除节点"""
             if self.plugin.graph_store is None:
                 raise HTTPException(status_code=503, detail="Graph store not initialized")
+            _ensure_web_write_allowed("删除实体")
                 
             try:
                 # 使用 GraphStore.delete_nodes 方法
@@ -815,6 +827,7 @@ class MemorixServer:
             """删除边"""
             if self.plugin.graph_store is None:
                 raise HTTPException(status_code=503, detail="Graph store not initialized")
+            _ensure_web_write_allowed("删除关系")
             
             try:
                 # 将权重设为 0 或移除
@@ -835,6 +848,7 @@ class MemorixServer:
             """创建节点"""
             if self.plugin.graph_store is None:
                 raise HTTPException(status_code=503, detail="Graph store not initialized")
+            _ensure_web_write_allowed("新增实体")
             
             try:
                 # 1. 使用 GraphStore.add_nodes 方法建立物理节点
@@ -856,6 +870,7 @@ class MemorixServer:
             """创建边 (支持语义关系)"""
             if self.plugin.graph_store is None:
                 raise HTTPException(status_code=503, detail="Graph store not initialized")
+            _ensure_web_write_allowed("新增关系")
             
             try:
                 # 确保节点存在
@@ -889,6 +904,7 @@ class MemorixServer:
             """重命名节点 (实际上是创建新节点，复制边，删除旧节点)"""
             if self.plugin.graph_store is None:
                 raise HTTPException(status_code=503, detail="Graph store not initialized")
+            _ensure_web_write_allowed("重命名实体")
             
             try:
                 # 检查旧节点是否存在
@@ -940,7 +956,13 @@ class MemorixServer:
             try:
                 # 0. 如果无任何参数，则返回文件列表 (Summary Mode)
                 if not data.node_id and not data.edge_source and not data.edge_target:
-                    sources = self.plugin.metadata_store.get_all_sources()
+                    sources = [
+                        {
+                            "source": source,
+                            "count": len(self.plugin.metadata_store.get_paragraphs_by_source(source)),
+                        }
+                        for source in self.plugin.metadata_store.get_all_sources()
+                    ]
                     return {"mode": "summary", "sources": sources}
                 # 1. 如果是查节点来源 (By Entity)
                 if data.node_id:
@@ -987,6 +1009,7 @@ class MemorixServer:
             """按来源批量删除（文件删除）"""
             if not self.plugin.metadata_store or not self.plugin.vector_store or not self.plugin.graph_store:
                  raise HTTPException(status_code=503, detail="Stores not fully initialized")
+            _ensure_web_write_allowed("删除来源批次")
                  
             try:
                 # 1. 找出所有相关段落
@@ -1047,6 +1070,7 @@ class MemorixServer:
             """删除来源段落（两阶段提交）"""
             if not self.plugin.metadata_store or not self.plugin.vector_store or not self.plugin.graph_store:
                  raise HTTPException(status_code=503, detail="Stores not fully initialized")
+            _ensure_web_write_allowed("删除来源段落")
                  
             try:
                 # === Phase 1: DB Transaction & Plan Generation ===
@@ -1137,6 +1161,7 @@ class MemorixServer:
             """从回收站恢复记忆"""
             if not self.plugin.metadata_store or not self.plugin.graph_store:
                 raise HTTPException(status_code=503, detail="Stores missing")
+            _ensure_web_write_allowed("恢复记忆")
 
             try:
                 if data.type == "entity":
@@ -1178,6 +1203,7 @@ class MemorixServer:
             s, t = data.id.split("_", 1) 
             
             if not self.plugin.graph_store: raise HTTPException(503, "Graph store missing")
+            _ensure_web_write_allowed("强化记忆")
             
             try:
                 gst = self.plugin.graph_store
@@ -1205,6 +1231,7 @@ class MemorixServer:
             s, t = data.id.split("_", 1)
             
             if not self.plugin.graph_store: raise HTTPException(503, "Graph store missing")
+            _ensure_web_write_allowed("冷冻记忆")
 
             try:
                 gst = self.plugin.graph_store
@@ -1233,6 +1260,7 @@ class MemorixServer:
             s, t = data.id.split("_", 1)
             
             if not self.plugin.graph_store: raise HTTPException(503, "Graph store missing")
+            _ensure_web_write_allowed("修改记忆保护状态")
 
             try:
                 gst = self.plugin.graph_store
@@ -1260,6 +1288,8 @@ class MemorixServer:
                 raise HTTPException(status_code=400, detail="人物画像功能未启用")
             if self.plugin.metadata_store is None:
                 raise HTTPException(status_code=503, detail="Metadata store not initialized")
+            if data.force_refresh and _web_read_only_enabled():
+                raise HTTPException(status_code=403, detail="Web 面板当前处于只读模式，禁止强制刷新人物画像")
             try:
                 service = _build_person_profile_service()
                 ttl_minutes = float(self.plugin.get_config("person_profile.profile_ttl_minutes", 360))
@@ -1381,6 +1411,7 @@ class MemorixServer:
                 raise HTTPException(status_code=400, detail="人物画像功能未启用")
             if self.plugin.metadata_store is None:
                 raise HTTPException(status_code=503, detail="Metadata store not initialized")
+            _ensure_web_write_allowed("保存人物画像修订")
             try:
                 service = _build_person_profile_service()
                 resolved_pid = await _run_sync(_resolve_person_id_for_web, service, data.person_id)
@@ -1420,6 +1451,7 @@ class MemorixServer:
             """清除人物画像手工覆盖。"""
             if self.plugin.metadata_store is None:
                 raise HTTPException(status_code=503, detail="Metadata store not initialized")
+            _ensure_web_write_allowed("清除人物画像修订")
             try:
                 service = _build_person_profile_service()
                 resolved_pid = _resolve_person_id_for_web(service, data.person_id)
@@ -1438,6 +1470,7 @@ class MemorixServer:
         @self.app.post("/api/save")
         async def manual_save():
             """手动保存所有数据到磁盘"""
+            _ensure_web_write_allowed("执行持久化")
             try:
                 saved_components = []
                 if self.plugin.graph_store is not None:
@@ -1454,6 +1487,7 @@ class MemorixServer:
 
         @self.app.post("/api/reindex")
         async def create_reindex_task(data: ReindexRequest):
+            _ensure_web_write_allowed("触发重建索引")
             try:
                 manager = await _ensure_task_manager()
                 task = await manager.enqueue_reindex_task(data.model_dump())
@@ -1518,6 +1552,7 @@ class MemorixServer:
         @self.app.post("/api/config/auto_save")
         async def set_auto_save(data: AutoSaveConfig):
             """设置自动保存开关（仅运行时生效）"""
+            _ensure_web_write_allowed("切换自动保存")
             self.plugin._runtime_auto_save = data.enabled
             logger.info(f"自动保存已{'启用' if data.enabled else '禁用'}（运行时）")
             return {"success": True, "auto_save_enabled": data.enabled}

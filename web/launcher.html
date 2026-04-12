@@ -307,7 +307,7 @@
         <div class="eyebrow">na_memorix launcher</div>
         <h1>三个界面的统一入口</h1>
         <p>
-          这里负责把主面板、导入中心、检索调优收拢到同一个选择页里。页面只做导航和状态汇总，不会绕过宿主权限，也不会修改你现有的访问边界。
+          这里负责把主面板、导入中心、检索调优收拢到同一个选择页里。主面板是当前正式可用入口；导入中心和检索调优仍按宿主桥接能力决定是否只是兼容页。
         </p>
         <div class="status-grid">
           <article class="status-card">
@@ -360,8 +360,8 @@
           id: "02",
           slug: "import",
           title: "导入中心",
-          desc: "负责上传、粘贴、本地扫描与迁移任务的统一入口，适合集中处理导入相关动作。",
-          items: ["前端路由已适配插件路径", "是否可执行任务取决于 import_backend 能力旗标", "即使后端未接入也可以先查看界面"],
+          desc: "导入相关的兼容入口页。只有在宿主真正接入 import_backend 后，页面里的任务能力才会变成可执行状态。",
+          items: ["前端路由已适配插件路径", "是否可执行任务取决于 import_backend 能力旗标", "默认应视为兼容说明页，而非正式导入后台"],
           featureKey: "import_backend",
           pageKey: "import",
           glow: "rgba(56, 189, 248, 0.22)",
@@ -370,8 +370,8 @@
           id: "03",
           slug: "tuning",
           title: "检索调优",
-          desc: "集中放运行时参数、调优任务和报告预览，适合做召回与排序参数观察。",
-          items: ["前端路由已适配插件路径", "是否可执行任务取决于 retrieval_tuning_backend 能力旗标", "可先作为调优工作台壳页面使用"],
+          desc: "检索调优的兼容工作台。只有在宿主真正接入 retrieval_tuning_backend 后，调优任务、应用参数和报告接口才会可用。",
+          items: ["前端路由已适配插件路径", "是否可执行任务取决于 retrieval_tuning_backend 能力旗标", "当前默认只应视为兼容页/壳页面"],
           featureKey: "retrieval_tuning_backend",
           pageKey: "tuning",
           glow: "rgba(251, 191, 36, 0.2)",

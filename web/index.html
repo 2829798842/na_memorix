@@ -1920,11 +1920,12 @@
         const meta = document.getElementById("reindex-status-meta");
         const button = document.getElementById("reindex-button");
         if (!meta || !button) return;
+        const readOnly = isWebReadOnly();
 
         if (!task || !task.task_id) {
-          meta.textContent = "Vectors: Idle";
-          button.disabled = false;
-          button.textContent = "Reindex";
+          meta.textContent = readOnly ? "Vectors: Idle | Read only" : "Vectors: Idle";
+          button.disabled = readOnly;
+          button.textContent = readOnly ? "Read only" : "Reindex";
           return;
         }
 
@@ -1938,8 +1939,9 @@
         };
         const label = labelMap[status] || status;
         meta.textContent = `Vectors: ${label} (${String(task.task_id).slice(0, 8)})`;
-        button.disabled = status === "queued" || status === "running";
-        button.textContent = button.disabled ? "Reindexing..." : "Reindex";
+        const isBusy = status === "queued" || status === "running";
+        button.disabled = readOnly || isBusy;
+        button.textContent = isBusy ? "Reindexing..." : readOnly ? "Read only" : "Reindex";
       }
 
       async function pollReindexTask(taskId) {
@@ -1964,6 +1966,7 @@
       }
 
       async function startReindex() {
+        if (guardReadOnlyAction("触发重建索引")) return;
         const button = document.getElementById("reindex-button");
         if (button) {
           button.disabled = true;
@@ -2025,6 +2028,61 @@
         }
       }
 
+      function isWebReadOnly() {
+        return !!pluginConfigSnapshot?.web_read_only;
+      }
+
+      function guardReadOnlyAction(actionLabel) {
+        if (!isWebReadOnly()) return false;
+        showToast(`当前为只读模式，禁止${actionLabel}`);
+        return true;
+      }
+
+      function prependReadOnlyNotice(message) {
+        const body = document.getElementById("panel-body");
+        if (!body || body.querySelector("[data-read-only-notice]")) return;
+        body.insertAdjacentHTML(
+          "afterbegin",
+          `<div data-read-only-notice="1" style="margin-bottom: 12px; padding: 10px 12px; border: 1px solid rgba(245, 158, 11, 0.35); border-radius: 10px; background: rgba(245, 158, 11, 0.12); color: #fcd34d; font-size: 0.82rem; line-height: 1.6;">${escapeHtml(message)}</div>`,
+        );
+      }
+
+      function encodeActionArg(value) {
+        return encodeURIComponent(String(value ?? ""));
+      }
+
+      function decodeActionArg(value) {
+        try {
+          return decodeURIComponent(String(value ?? ""));
+        } catch (_) {
+          return String(value ?? "");
+        }
+      }
+
+      function focusNodeFromEncoded(encodedNodeId) {
+        focusNode(decodeActionArg(encodedNodeId));
+      }
+
+      function selectEdgeFromEncoded(encodedEdgeId) {
+        selectEdge(decodeActionArg(encodedEdgeId));
+      }
+
+      function selectSearchResultFromEncoded(encodedNodeId) {
+        selectSearchResult(decodeActionArg(encodedNodeId));
+      }
+
+      function setSourceFilterFromEncoded(encodedSource) {
+        setSourceFilter(decodeActionArg(encodedSource));
+      }
+
+      function deleteSourceFileFromEncoded(encodedSource) {
+        deleteSourceFile(decodeActionArg(encodedSource));
+      }
+
+      function restoreMemoryFromEncoded(encodedHash, encodedType) {
+        restoreMemory(decodeActionArg(encodedHash), decodeActionArg(encodedType));
+      }
+
       function layout() {
         if (network) network.stabilize();
       }
@@ -2036,16 +2094,22 @@
         const title = document.getElementById("panel-title");
         const body = document.getElementById("panel-body");
 
+        if (type === "add-node-panel" && guardReadOnlyAction("新增实体")) return;
+        if (type === "add-edge-panel" && guardReadOnlyAction("新增关系")) return;
+
         panel.style.display = "flex";
 
         if (type === "node-editor") {
           title.innerText = "实体属性";
           body.innerHTML = document.getElementById("node-editor-tpl").innerHTML;
+          if (isWebReadOnly()) {
+            prependReadOnlyNotice("当前为只读模式，网页端实体改写与快速建边已禁用。");
+          }
 
           // Display Label, use ID for logic
           const nodeObj = nodes.get(data);
           document.getElementById("node-id-display").innerText = nodeObj
-            ? nodeObj.label
+            ? nodeObj.hiddenLabel || nodeObj.label || data
             : data;
 
           renderNodeRelations(data);
@@ -2055,6 +2119,9 @@
         } else if (type === "edge-editor") {
           title.innerText = "关系属性";
           body.innerHTML = document.getElementById("edge-editor-tpl").innerHTML;
+          if (isWebReadOnly()) {
+            prependReadOnlyNotice("当前为只读模式，网页端关系编辑与记忆控制已禁用。");
+          }
           window.viewedEdgeId = data.id; // Correctly track viewed edge ID for actions
           
           // Display Source -> Target
@@ -2062,8 +2129,8 @@
           const relationName = data.label || (data.predicates ? data.predicates.join(", ") : "关联");
           
           document.getElementById("edge-title-display").innerHTML =
-            `<div style="font-weight: bold;">${data.from} <span style="color: var(--text-dim)">➔</span> ${data.to}</div>
-             <div style="font-size: 0.9rem; color: var(--accent-primary); margin-top: 4px;">${relationName}</div>`;
+            `<div style="font-weight: bold;">${escapeHtml(data.from)} <span style="color: var(--text-dim)">➔</span> ${escapeHtml(data.to)}</div>
+             <div style="font-size: 0.9rem; color: var(--accent-primary); margin-top: 4px;">${escapeHtml(relationName)}</div>`;
           document.getElementById("weight-slider").value = data.value || 1.0;
           document.getElementById("weight-val-display").innerText = (
             data.value || 1.0
@@ -2082,11 +2149,17 @@
           const tpl = document.getElementById("recycle-bin-tpl");
           title.innerText = "记忆回收站";
           body.innerHTML = tpl ? tpl.innerHTML : "Error: Template missing";
+          if (isWebReadOnly()) {
+            prependReadOnlyNotice("当前为只读模式，回收站恢复操作已禁用。");
+          }
           loadRecycleBin();
         } else if (type === "source-manager-panel") {
           title.innerText = "记忆溯源管理";
           body.innerHTML =
             document.getElementById("source-manager-tpl").innerHTML;
+          if (isWebReadOnly()) {
+            prependReadOnlyNotice("当前为只读模式，自动保存开关与来源删除已禁用。");
+          }
           loadSourceFiles();
           // Check auto-save state
           axios.get("/api/config").then((res) => {
@@ -2097,6 +2170,9 @@
           title.innerText = "人物画像管理";
           body.innerHTML =
             document.getElementById("person-profile-tpl").innerHTML;
+          if (isWebReadOnly()) {
+            prependReadOnlyNotice("当前为只读模式，禁止强制刷新与画像修订，仅允许查看。");
+          }
           window.currentPersonProfile = null;
           window.personProfileListState = {
             page: 1,
@@ -2117,6 +2193,9 @@
           title.innerText = "视图策略配置";
           body.innerHTML =
             document.getElementById("view-settings-tpl").innerHTML;
+          if (isWebReadOnly()) {
+            prependReadOnlyNotice("当前为只读模式，写入类快捷操作会被拦截。");
+          }
           updateSettingsUI();
           // Set initial slider value
           document.getElementById("density-slider").value = infoDensity;
@@ -2271,6 +2350,7 @@
       async function queryPersonProfile(forceRefresh = false, explicitPersonId = "") {
         const keywordEl = document.getElementById("person-profile-keyword");
         if (!keywordEl) return;
+        if (forceRefresh && guardReadOnlyAction("强制刷新人物画像")) return;
 
         const raw = explicitPersonId || keywordEl.value.trim();
         if (!raw) {
@@ -2298,6 +2378,7 @@
       async function savePersonProfileOverride() {
         const overrideEl = document.getElementById("person-profile-override");
         if (!overrideEl) return;
+        if (guardReadOnlyAction("保存画像修订")) return;
 
         const current = window.currentPersonProfile || {};
         const personId = (current.person_id || "").trim();
@@ -2325,6 +2406,7 @@
       }
 
       async function clearPersonProfileOverride() {
+        if (guardReadOnlyAction("清除画像修订")) return;
         const current = window.currentPersonProfile || {};
         const personId = (current.person_id || "").trim();
         if (!personId) {
@@ -2359,6 +2441,7 @@
       }
 
       async function manualSave() {
+        if (guardReadOnlyAction("执行持久化")) return;
         showToast("同步持久化层...");
         try {
           const res = await axios.post("/api/save");
@@ -2371,6 +2454,7 @@
       // --- Actions ---
 
       async function renameNode() {
+        if (guardReadOnlyAction("重命名实体")) return;
         const oldId = currentSelection.data;
         const newId = document.getElementById("rename-input").value.trim();
         if (!newId) return showToast("请输入名称");
@@ -2392,6 +2476,7 @@
       }
 
       async function deleteNode() {
+        if (guardReadOnlyAction("删除实体")) return;
         const nodeId = currentSelection.data;
         if (!confirm(`确认从全局全景中剥离实体 "${nodeId}"？`)) return;
         try {
@@ -2405,6 +2490,7 @@
       }
 
       async function saveEdge() {
+        if (guardReadOnlyAction("修改关系权重")) return;
         const edge = currentSelection.data;
         const weight = parseFloat(
           document.getElementById("weight-slider").value,
@@ -2423,6 +2509,7 @@
       }
 
       async function deleteEdge() {
+        if (guardReadOnlyAction("删除关系")) return;
         const edge = currentSelection.data;
         if (!confirm("确定切断此映射连接？")) return;
         try {
@@ -2438,6 +2525,7 @@
       }
 
       async function addNode() {
+        if (guardReadOnlyAction("新增实体")) return;
         const name = document.getElementById("new-node-name").value.trim();
         if (!name) return;
         try {
@@ -2451,6 +2539,7 @@
       }
 
       async function addEdge() {
+        if (guardReadOnlyAction("新增关系")) return;
         const source = document.getElementById("edge-source").value.trim();
         const target = document.getElementById("edge-target").value.trim();
         const predicate = document
@@ -2473,6 +2562,7 @@
       }
 
       async function submitQuickRelation() {
+        if (guardReadOnlyAction("新增关系")) return;
         const cur = currentSelection.data;
         const tgt = document.getElementById("quick-target").value.trim();
         const pre = document.getElementById("quick-predicate").value.trim();
@@ -2665,7 +2755,7 @@
             html += `
                         <div class="list-item">
                             <div style="font-size: 0.85rem; color: white;">${escapeHtml(s.content)}</div>
-                            <div style="font-size: 0.7rem; color: var(--accent-secondary); margin-top: 6px;">来自: ${s.source}</div>
+                            <div style="font-size: 0.7rem; color: var(--accent-secondary); margin-top: 6px;">来自: ${escapeHtml(s.source)}</div>
                         </div>
                     `;
           });
@@ -2690,13 +2780,14 @@
         connectedEdges.forEach((e) => {
           const isOut = e.from === nodeId;
           const other = isOut ? e.to : e.from;
+          const otherEncoded = encodeActionArg(other);
           html += `
                     <div class="list-item" style="display: flex; justify-content: space-between; align-items: center;">
-                        <div style="cursor: pointer; display: flex; align-items: center;" onclick="focusNode('${other}')" title="跳转至该实体">
+                        <div style="cursor: pointer; display: flex; align-items: center;" onclick="focusNodeFromEncoded('${otherEncoded}')" title="跳转至该实体">
                             <span style="color: ${isOut ? "var(--accent-primary)" : "var(--accent-secondary)"}; font-weight: 600;">${isOut ? "➔" : "←"}</span>
-                            <span style="margin-left: 8px; font-size: 0.85rem; border-bottom: 1px dashed rgba(255,255,255,0.3);">${other}</span>
+                            <span style="margin-left: 8px; font-size: 0.85rem; border-bottom: 1px dashed rgba(255,255,255,0.3);">${escapeHtml(other)}</span>
                         </div>
-                        <span style="color: var(--text-dim); font-size: 0.75rem;">${e.label || "-"}</span>
+                        <span style="color: var(--text-dim); font-size: 0.75rem;">${escapeHtml(e.label || "-")}</span>
                     </div>
                 `;
         });
@@ -2708,32 +2799,38 @@
         root.innerHTML = "加载中...";
         try {
           const res = await axios.post("/api/source/list", {});
-          const sources = res.data.sources;
+          const sources = Array.isArray(res.data.sources) ? res.data.sources : [];
+          const readOnly = isWebReadOnly();
 
           // 筛选状态显示 (Filter status display)
           let header = "";
           if (currentSource) {
             header = `<div style="padding: 10px; background: rgba(56, 189, 248, 0.2); border-radius: 8px; margin-bottom: 15px; display: flex; justify-content: space-between; align-items: center;">
-                        <span>🔎 当前聚焦: <b>${currentSource}</b></span>
+                        <span>🔎 当前聚焦: <b>${escapeHtml(currentSource)}</b></span>
                         <button class="btn btn-ghost" style="padding: 4px 10px; font-size: 0.8rem;" onclick="setSourceFilter(null)">重置 / 查看全部</button>
                     </div>`;
           }
 
           const listHtml = sources
-            .map(
-              (f) => `
+            .map((f) => {
+              const sourceName = String(f.source || "");
+              const sourceEncoded = encodeActionArg(sourceName);
+              const deleteButton = readOnly
+                ? `<button class="btn btn-danger" style="padding: 4px 8px; opacity: 0.55; cursor: not-allowed;" disabled title="只读模式下不可删除">🗑️</button>`
+                : `<button class="btn btn-danger" style="padding: 4px 8px;" onclick="deleteSourceFileFromEncoded('${sourceEncoded}')" title="删除">🗑️</button>`;
+              return `
                     <div class="list-item" style="display: flex; justify-content: space-between; align-items: center;">
                         <div style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; margin-right: 15px;">
-                            <div style="font-size: 0.9rem; color: ${currentSource === f.source ? "var(--accent-primary)" : "white"};">${f.source}</div>
-                            <div style="font-size: 0.7rem; color: var(--text-dim);">${f.count} 段记忆记录</div>
+                            <div style="font-size: 0.9rem; color: ${currentSource === sourceName ? "var(--accent-primary)" : "white"};">${escapeHtml(sourceName)}</div>
+                            <div style="font-size: 0.7rem; color: var(--text-dim);">${Number(f.count || 0)} 段记忆记录</div>
                         </div>
                         <div style="display: flex; gap: 6px;">
-                            <button class="btn btn-ghost" style="padding: 4px 8px;" onclick="setSourceFilter('${f.source}')" title="聚焦此批次">👁️</button>
-                            <button class="btn btn-danger" style="padding: 4px 8px;" onclick="deleteSourceFile('${f.source}')" title="删除">🗑️</button>
+                            <button class="btn btn-ghost" style="padding: 4px 8px;" onclick="setSourceFilterFromEncoded('${sourceEncoded}')" title="聚焦此批次">👁️</button>
+                            ${deleteButton}
                         </div>
                     </div>
-                `,
-            )
+                `;
+            })
             .join("");
 
           root.innerHTML = header + listHtml;
@@ -2751,6 +2848,7 @@
       }
 
       async function deleteSourceFile(src) {
+        if (guardReadOnlyAction("删除来源批次")) return;
         if (
           !confirm(
             `危险：一旦擦除 "${src}"，所有相关的关联与记忆将永久消失。是否继续？`,
@@ -2768,6 +2866,11 @@
       }
 
       async function toggleAutoSave(enabled) {
+        if (guardReadOnlyAction("切换自动保存")) {
+          const toggle = document.getElementById("auto-save-toggle");
+          if (toggle) toggle.checked = !enabled;
+          return;
+        }
         try {
           await axios.post("/api/config/auto_save", { enabled });
           showToast(enabled ? "自动保存激活" : "自动保存已挂起");
@@ -3033,9 +3136,10 @@
           container.innerHTML = matches
             .map((n) => {
               const displayLabel = n.hiddenLabel || n.label || n.id;
+              const encodedNodeId = encodeActionArg(n.id);
               return `
-                <div class="search-item" onclick="selectSearchResult('${n.id}')">
-                    <span>${displayLabel}</span>
+                <div class="search-item" onclick="selectSearchResultFromEncoded('${encodedNodeId}')">
+                    <span>${escapeHtml(displayLabel)}</span>
                     <span style="font-size:0.7rem; color:var(--text-dim)">${n.isHub ? "核心" : "节点"}</span>
                 </div>
               `;
@@ -3142,15 +3246,17 @@
 
       function renderBrowserItem(item, tab) {
         if (tab === "nodes") {
+          const encodedNodeId = encodeActionArg(item.data.id);
           return `
-                <div class="list-item" style="cursor: pointer; margin-bottom: 4px;" onclick="focusNode('${item.data.id}')">
-                    <div style="font-weight: 500;">${item.display}</div>
+                <div class="list-item" style="cursor: pointer; margin-bottom: 4px;" onclick="focusNodeFromEncoded('${encodedNodeId}')">
+                    <div style="font-weight: 500;">${escapeHtml(item.display)}</div>
                 </div>`;
         } else {
+          const encodedEdgeId = encodeActionArg(item.data.id);
           return `
-                <div class="list-item" style="cursor: pointer; margin-bottom: 4px;" onclick="selectEdge('${item.data.id}')">
-                    <div style="font-size: 0.85rem;">${item.display}</div>
-                    <div style="font-size: 0.75rem; color: var(--accent-secondary);">${item.sub || ""}</div>
+                <div class="list-item" style="cursor: pointer; margin-bottom: 4px;" onclick="selectEdgeFromEncoded('${encodedEdgeId}')">
+                    <div style="font-size: 0.85rem;">${escapeHtml(item.display)}</div>
+                    <div style="font-size: 0.75rem; color: var(--accent-secondary);">${escapeHtml(item.sub || "")}</div>
                 </div>`;
         }
       }
@@ -3175,6 +3281,7 @@
       }
 
       function escapeHtml(text) {
+        const value = String(text ?? "");
         const map = {
           "&": "&amp;",
           "<": "&lt;",
@@ -3182,12 +3289,13 @@
           '"': "&quot;",
           "'": "&#039;",
         };
-        return text.replace(/[&<>"']/g, (m) => map[m]);
+        return value.replace(/[&<>"']/g, (m) => map[m]);
       }
 
       // --- V5 记忆功能函数 (V5 Memory Functions) ---
 
       async function restoreMemory(hash, type) {
+          if (guardReadOnlyAction("恢复记忆")) return;
           try {
              type = type || 'relation'; // fallback
              const res = await axios.post("/api/memory/restore", { hash, type });
@@ -3212,18 +3320,23 @@
                  root.innerHTML = '<div style="text-align:center; padding:20px; color:var(--text-dim)">暂无删除记录</div>';
                  return;
               }
+              const readOnly = isWebReadOnly();
               
               root.innerHTML = items.map(item => {
                   let displayHtml = '';
-                  let typeIcon = '';
                   const itemType = item.type || 'relation'; // default
+                  const encodedHash = encodeActionArg(item.hash || "");
+                  const encodedType = encodeActionArg(itemType);
+                  const restoreButton = readOnly
+                    ? `<button class="btn btn-ghost" style="padding:4px 8px; color:var(--accent-primary); opacity:0.55; cursor:not-allowed;" disabled title="只读模式下不可恢复">♻️</button>`
+                    : `<button class="btn btn-ghost" style="padding:4px 8px; color:var(--accent-primary);" onclick="restoreMemoryFromEncoded('${encodedHash}', '${encodedType}')" title="恢复">♻️</button>`;
                   
                   if (itemType === 'entity') {
                       displayHtml = `<div style="font-size:0.9rem; font-weight:600; color:var(--text-main);">${escapeHtml(item.name)} <span style="font-size:0.75rem; color:#ef4444; border:1px solid #ef4444; border-radius:4px; padding:0 4px;">实体</span></div>`;
                   } else {
                       displayHtml = `
-                          <div style="font-size:0.9rem; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; color:var(--text-main);">${item.subject} ➔ ${item.object}</div>
-                          <div style="font-size:0.75rem; color:var(--text-dim); margin-top:4px;">${item.predicate || '关联'}</div>`;
+                          <div style="font-size:0.9rem; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; color:var(--text-main);">${escapeHtml(item.subject)} ➔ ${escapeHtml(item.object)}</div>
+                          <div style="font-size:0.75rem; color:var(--text-dim); margin-top:4px;">${escapeHtml(item.predicate || '关联')}</div>`;
                   }
                   
                   return `
@@ -3232,7 +3345,7 @@
                           ${displayHtml}
                           <div style="font-size:0.7rem; color:var(--text-dim); margin-top:2px;">删于: ${new Date(item.deleted_at * 1000).toLocaleString()}</div>
                       </div>
-                      <button class="btn btn-ghost" style="padding:4px 8px; color:var(--accent-primary);" onclick="restoreMemory('${item.hash}', '${itemType}')" title="恢复">♻️</button>
+                      ${restoreButton}
                   </div>
               `}).join("");
           } catch(err) {
@@ -3241,6 +3354,7 @@
       }
 
       async function reinforceEdge() {
+         if (guardReadOnlyAction("强化记忆")) return;
          if(!window.viewedEdgeId) return;
          try {
              await axios.post("/api/memory/reinforce", { id: window.viewedEdgeId });
@@ -3252,6 +3366,7 @@
       }
 
       async function protectEdge() {
+         if (guardReadOnlyAction("修改记忆保护状态")) return;
          if(!window.viewedEdgeId) return;
          
          const edge = edges.get(window.viewedEdgeId);
@@ -3276,6 +3391,7 @@
       }
 
       async function freezeEdge() {
+         if (guardReadOnlyAction("冷冻记忆")) return;
          if(!window.viewedEdgeId) return;
          if(!confirm("确定要冷冻此记忆吗？这将使其变为非活跃状态 (虚线显示)。")) return;
          

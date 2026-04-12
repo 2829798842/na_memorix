@@ -523,9 +523,7 @@
                 <button id="tab-paste">粘贴导入</button>
                 <button id="tab-raw">本地扫描</button>
                 <button id="tab-openie">LPMM OpenIE</button>
-                <button id="tab-convert">LPMM转换</button>
                 <button id="tab-backfill">时序回填</button>
-                <button id="tab-maibot">MaiBot迁移</button>
               </div>
 
               <div class="row3">
@@ -718,64 +716,6 @@
                 </div>
               </div>
 
-              <div id="panel-convert" class="panel">
-                <div class="row">
-                  <div>
-                    <label>输入别名</label>
-                    <select id="convert-alias"></select>
-                  </div>
-                  <div>
-                    <label>输入相对路径（relative_path）</label>
-                    <input
-                      id="convert-relative-path"
-                      placeholder="LPMM 数据目录"
-                    />
-                  </div>
-                </div>
-                <div class="row">
-                  <div>
-                    <label>目标别名</label>
-                    <select id="convert-target-alias"></select>
-                  </div>
-                  <div>
-                    <label>目标相对路径（relative_path）</label>
-                    <input
-                      id="convert-target-relative-path"
-                      placeholder="可选：目标子目录"
-                    />
-                  </div>
-                </div>
-                <div class="row3">
-                  <div>
-                    <label>向量维度（dimension）</label>
-                    <input
-                      id="convert-dimension"
-                      type="number"
-                      min="1"
-                      placeholder="默认读取配置"
-                    />
-                  </div>
-                  <div>
-                    <label>批大小（batch_size）</label>
-                    <input
-                      id="convert-batch-size"
-                      type="number"
-                      min="1"
-                      value="1024"
-                    />
-                  </div>
-                  <div></div>
-                </div>
-                <div class="tiny">
-                  将执行 staging 转换与切换，请确认输入目录正确。
-                </div>
-                <div class="btns" style="margin-top: 8px">
-                  <button class="btn warn" id="convert-submit">
-                    提交 LPMM 转换任务
-                  </button>
-                </div>
-              </div>
-
               <div id="panel-backfill" class="panel">
                 <div class="row">
                   <div>
@@ -816,119 +756,6 @@
                 </div>
               </div>
 
-              <div id="panel-maibot" class="panel">
-                <div class="row">
-                  <div>
-                    <label>源数据库路径</label>
-                    <input id="maibot-source-db" placeholder="data/MaiBot.db" />
-                  </div>
-                  <div>
-                    <label>时间范围（可选）</label>
-                    <input
-                      id="maibot-time-from"
-                      placeholder="from: YYYY-MM-DD HH:mm"
-                    />
-                  </div>
-                </div>
-                <div class="row">
-                  <div>
-                    <label>时间范围（可选）</label>
-                    <input
-                      id="maibot-time-to"
-                      placeholder="to: YYYY-MM-DD HH:mm"
-                    />
-                  </div>
-                  <div>
-                    <label>ID范围（可选）</label>
-                    <input
-                      id="maibot-start-id"
-                      type="number"
-                      min="1"
-                      placeholder="start_id"
-                    />
-                  </div>
-                </div>
-                <div class="row">
-                  <div>
-                    <label>ID范围（可选）</label>
-                    <input
-                      id="maibot-end-id"
-                      type="number"
-                      min="1"
-                      placeholder="end_id"
-                    />
-                  </div>
-                  <div>
-                    <label>stream_ids（逗号分隔）</label>
-                    <input
-                      id="maibot-stream-ids"
-                      placeholder="stream1,stream2"
-                    />
-                  </div>
-                </div>
-                <div class="row">
-                  <div>
-                    <label>group_ids（逗号分隔）</label>
-                    <input id="maibot-group-ids" placeholder="123456,234567" />
-                  </div>
-                  <div>
-                    <label>user_ids（逗号分隔）</label>
-                    <input id="maibot-user-ids" placeholder="10001,10002" />
-                  </div>
-                </div>
-                <div class="row3">
-                  <div>
-                    <label>读取批大小（read_batch_size）</label>
-                    <input
-                      id="maibot-read-batch-size"
-                      type="number"
-                      min="1"
-                      value="2000"
-                    />
-                  </div>
-                  <div>
-                    <label>提交窗口行数（commit_window_rows）</label>
-                    <input
-                      id="maibot-commit-window-rows"
-                      type="number"
-                      min="1"
-                      value="20000"
-                    />
-                  </div>
-                  <div>
-                    <label>嵌入工作线程（embed_workers）</label>
-                    <input
-                      id="maibot-embed-workers"
-                      type="number"
-                      min="1"
-                      placeholder="默认读取配置"
-                    />
-                  </div>
-                </div>
-                <div class="checkgrid tiny">
-                  <label class="checkline">
-                    <input id="maibot-no-resume" type="checkbox" />
-                    <span>禁用断点续传（--no-resume）</span>
-                  </label>
-                  <label class="checkline">
-                    <input id="maibot-reset-state" type="checkbox" />
-                    <span>重置迁移状态（--reset-state）</span>
-                  </label>
-                  <label class="checkline">
-                    <input id="maibot-dry-run" type="checkbox" />
-                    <span>仅预览（--dry-run）</span>
-                  </label>
-                  <label class="checkline">
-                    <input id="maibot-verify-only" type="checkbox" />
-                    <span>仅校验（--verify-only）</span>
-                  </label>
-                </div>
-                <div class="btns" style="margin-top: 8px">
-                  <button class="btn p" id="maibot-submit">
-                    提交 MaiBot 迁移任务
-                  </button>
-                </div>
-              </div>
             </div>
           </div>
 
@@ -1261,9 +1088,7 @@
           "paste-submit",
           "raw-submit",
           "openie-submit",
-          "convert-submit",
           "backfill-submit",
-          "maibot-submit",
           "refresh-btn",
           "cancel-btn",
           "retry-btn",
@@ -1417,8 +1242,6 @@
         [
           "raw-alias",
           "openie-alias",
-          "convert-alias",
-          "convert-target-alias",
           "backfill-alias",
         ].forEach((id) => {
           const el = $(id);
@@ -1430,13 +1253,6 @@
             if (id === "raw-alias" && keys.includes("raw")) el.value = "raw";
             else if (id === "openie-alias" && keys.includes("lpmm"))
               el.value = "lpmm";
-            else if (id === "convert-alias" && keys.includes("lpmm"))
-              el.value = "lpmm";
-            else if (
-              id === "convert-target-alias" &&
-              keys.includes("plugin_data")
-            )
-              el.value = "plugin_data";
             else if (id === "backfill-alias" && keys.includes("plugin_data"))
               el.value = "plugin_data";
           }
@@ -1494,11 +1310,6 @@
           $("file-concurrency").max = state.settings.max_file_concurrency;
         if (state.settings.max_chunk_concurrency)
           $("chunk-concurrency").max = state.settings.max_chunk_concurrency;
-        if (
-          state.settings.maibot_source_db_default &&
-          !$("maibot-source-db").dataset.touched
-        )
-          $("maibot-source-db").value = state.settings.maibot_source_db_default;
         populateAliasSelects();
         if (!state.taskId && state.tasks.length)
           state.taskId = state.tasks[0].task_id;
@@ -1686,32 +1497,6 @@
         toast("LPMM OpenIE 任务已创建");
       }
 
-      async function createLpmmConvertTask() {
-        if (
-          !confirm(
-            "该任务会执行 staging 转换并切换 vectors/graph/metadata，是否继续？",
-          )
-        )
-          return;
-        const payload = {
-          alias: $("convert-alias").value,
-          relative_path: ($("convert-relative-path").value || "").trim(),
-          target_alias: $("convert-target-alias").value,
-          target_relative_path: (
-            $("convert-target-relative-path").value || ""
-          ).trim(),
-          dimension: numOrNull($("convert-dimension").value),
-          batch_size: numOrNull($("convert-batch-size").value),
-        };
-        const d = await req("/api/import/tasks/lpmm_convert", {
-          method: "POST",
-          headers: headers(true),
-          body: JSON.stringify(payload),
-        });
-        if (d?.task?.task_id) state.taskId = d.task.task_id;
-        toast("LPMM 转换任务已创建");
-      }
-
       async function createTemporalBackfillTask() {
         const payload = {
           alias: $("backfill-alias").value,
@@ -1727,33 +1512,6 @@
         });
         if (d?.task?.task_id) state.taskId = d.task.task_id;
         toast("时序回填任务已创建");
-      }
-
-      async function createMaibotMigrationTask() {
-        const payload = {
-          source_db: ($("maibot-source-db").value || "").trim() || null,
-          time_from: ($("maibot-time-from").value || "").trim() || null,
-          time_to: ($("maibot-time-to").value || "").trim() || null,
-          stream_ids: parseCsvList($("maibot-stream-ids").value),
-          group_ids: parseCsvList($("maibot-group-ids").value),
-          user_ids: parseCsvList($("maibot-user-ids").value),
-          start_id: numOrNull($("maibot-start-id").value),
-          end_id: numOrNull($("maibot-end-id").value),
-          read_batch_size: numOrNull($("maibot-read-batch-size").value),
-          commit_window_rows: numOrNull($("maibot-commit-window-rows").value),
-          embed_workers: numOrNull($("maibot-embed-workers").value),
-          no_resume: !!$("maibot-no-resume").checked,
-          reset_state: !!$("maibot-reset-state").checked,
-          dry_run: !!$("maibot-dry-run").checked,
-          verify_only: !!$("maibot-verify-only").checked,
-        };
-        const d = await req("/api/import/tasks/maibot_migration", {
-          method: "POST",
-          headers: headers(true),
-          body: JSON.stringify(payload),
-        });
-        if (d?.task?.task_id) state.taskId = d.task.task_id;
-        toast("MaiBot 迁移任务已创建");
       }
 
       async function cancelTask() {
@@ -1839,9 +1597,7 @@
           "paste",
           "raw",
           "openie",
-          "convert",
           "backfill",
-          "maibot",
         ];
         const activateTab = (name) => {
           tabs.forEach((t) => {
@@ -1863,7 +1619,6 @@
         $("file-concurrency").oninput = (e) => (e.target.dataset.touched = "1");
         $("chunk-concurrency").oninput = (e) =>
           (e.target.dataset.touched = "1");
-        $("maibot-source-db").oninput = (e) => (e.target.dataset.touched = "1");
         $("upload-file-pick").onclick = () => $("upload-file-input").click();
         $("upload-file-input").onchange = (e) => {
           Array.from(e.target.files || []).forEach((f) => state.files.push(f));
@@ -1912,28 +1667,12 @@
             toast(`OpenIE 导入失败: ${e.message}`);
           }
         };
-        $("convert-submit").onclick = async () => {
-          try {
-            await createLpmmConvertTask();
-            await poll();
-          } catch (e) {
-            toast(`LPMM 转换失败: ${e.message}`);
-          }
-        };
         $("backfill-submit").onclick = async () => {
           try {
             await createTemporalBackfillTask();
             await poll();
           } catch (e) {
             toast(`回填任务失败: ${e.message}`);
-          }
-        };
-        $("maibot-submit").onclick = async () => {
-          try {
-            await createMaibotMigrationTask();
-            await poll();
-          } catch (e) {
-            toast(`迁移任务创建失败: ${e.message}`);
           }
         };
         $("refresh-btn").onclick = async () => {
