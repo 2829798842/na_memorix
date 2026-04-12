@@ -1848,7 +1848,7 @@
           // 更新建议列表 (Update datalist)
           const datalist = document.getElementById("node-list-suggestions");
           datalist.innerHTML = data.nodes
-            .map((n) => `<option value="${n.id}">`)
+            .map((n) => `<option value="${escapeHtml(n.id)}"></option>`)
             .join("");
 
           // 统一隐藏 Loading

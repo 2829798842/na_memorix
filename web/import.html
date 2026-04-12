@@ -1324,9 +1324,10 @@ Content-Type: application/json
             `来源: ${srcText}${sourceDesc ? ` | ${sourceDesc}` : ""}`;
           $("guide-body").innerHTML = renderGuideMarkdown(d.content || "");
         } catch (e) {
-          $("guide-meta").textContent = "";
-          $("guide-body").innerHTML =
-            `<p style="color:#fca5a5;">文档加载失败: ${esc(e.message || "")}</p>`;
+          $("guide-meta").textContent = "来源: 兼容页内置说明（桥接文档端点不可用）";
+          $("guide-body").innerHTML = renderGuideMarkdown(
+            `${IMPORT_COMPAT_GUIDE}\n\n> 附加说明：旧版文档桥接端点当前不可用，已自动回退到内置兼容说明。`,
+          );
         }
       }
 

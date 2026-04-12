@@ -1513,8 +1513,13 @@ class MemorixServer:
         @self.app.get("/api/config")
         async def get_config():
             """获取配置（脱敏只读）"""
+            runtime_auto_save = self.plugin._runtime_auto_save
             base_payload = {
-                "auto_save_enabled": self.plugin.get_config("advanced.enable_auto_save", True),
+                "auto_save_enabled": (
+                    bool(runtime_auto_save)
+                    if runtime_auto_save is not None
+                    else self.plugin.get_config("advanced.enable_auto_save", True)
+                ),
                 "auto_save_interval": self.plugin.get_config("advanced.auto_save_interval_minutes", 5),
                 "global_memory_enabled": self.plugin.get_config("memory.enabled", True),
                 "auto_inject_enabled": self.plugin.get_config("routing.auto_inject_enabled", True),
