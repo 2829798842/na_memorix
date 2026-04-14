@@ -522,7 +522,7 @@
       <div class="top">
         <div>
           <div class="title">A_Memorix 导入中心</div>
-          <div class="sub" id="page-subtitle">宿主导入兼容页；只有在 import_backend 接入后才会恢复旧版 Web 导入工作台</div>
+          <div class="sub" id="page-subtitle">宿主导入中心</div>
         </div>
         <div class="top-mid">
           <button class="btn" id="guide-open" type="button">
@@ -568,7 +568,7 @@
             <div class="bd">
               <div class="tiny" style="margin-bottom: 8px">
                 当前插件真正可用的是宿主根路径下的 <code>/v1/import/tasks</code> 异步任务接口。
-                旧版 Web 导入台依赖的 <code>/api/import/*</code> 桥接后端尚未挂载，所以页面已切换为兼容说明模式。
+                导入页依赖的 <code>/api/import/*</code> 桥接后端尚未挂载，所以页面已切换为兼容说明模式。
               </div>
               <pre id="compat-request-example" class="compat-code"></pre>
             </div>
@@ -585,7 +585,6 @@
                 <button id="tab-upload" class="active">上传文件</button>
                 <button id="tab-paste">粘贴导入</button>
                 <button id="tab-raw">本地扫描</button>
-                <button id="tab-openie">LPMM OpenIE</button>
                 <button id="tab-backfill">时序回填</button>
               </div>
 
@@ -750,31 +749,6 @@
                 <div class="btns" style="margin-top: 8px">
                   <button class="btn p" id="raw-submit">
                     提交本地扫描任务
-                  </button>
-                </div>
-              </div>
-
-              <div id="panel-openie" class="panel">
-                <div class="row">
-                  <div>
-                    <label>路径别名</label>
-                    <select id="openie-alias"></select>
-                  </div>
-                  <div>
-                    <label>相对路径（relative_path）</label>
-                    <input
-                      id="openie-relative-path"
-                      placeholder="OpenIE 目录或文件"
-                    />
-                  </div>
-                </div>
-                <label class="checkline tiny">
-                  <input id="openie-include-all" type="checkbox" />
-                  <span>找不到 *-openie.json 时回退全部 .json</span>
-                </label>
-                <div class="btns" style="margin-top: 8px">
-                  <button class="btn p" id="openie-submit">
-                    提交 OpenIE 任务
                   </button>
                 </div>
               </div>
@@ -961,7 +935,7 @@
       };
       const IMPORT_COMPAT_GUIDE = `# 导入中心兼容页
 
-当前宿主还没有挂载旧版 Web 导入台依赖的 \`/api/import/*\` 桥接接口，所以此页面会自动切换成兼容说明模式。
+当前宿主还没有挂载导入页依赖的 \`/api/import/*\` 桥接接口，所以此页面会自动切换成兼容说明模式。
 
 ## 现在真实可用的入口
 
@@ -978,9 +952,9 @@
 
 ## 为什么旧表单现在不可用
 
-上传、本地扫描、OpenIE、时序回填、任务队列、文件级状态、分块级状态这些面板，依赖的是旧版 \`/api/import/*\` Web 桥接层，而不是当前已经接入的 \`/v1/import/tasks\`。
+上传、本地扫描、粘贴导入、时序回填、任务队列、文件级状态、分块级状态这些面板，依赖的是导入页所需的 \`/api/import/*\` Web 桥接层，而不是当前已经接入的 \`/v1/import/tasks\`。
 
-后续如果宿主补齐对应桥接后端，这个页面会自动恢复成旧版工作台。`;
+后续如果宿主补齐对应桥接后端，这个页面会自动恢复成完整导入工作台。`;
       const IMPORT_COMPAT_REQUEST_EXAMPLE = `POST /v1/import/tasks
 Content-Type: application/json
 
@@ -1061,23 +1035,18 @@ Content-Type: application/json
         upload: "上传文件",
         paste: "粘贴导入",
         raw_scan: "本地扫描",
-        lpmm_openie: "LPMM OpenIE",
-        lpmm_convert: "LPMM 转换",
         temporal_backfill: "时序回填",
         maibot_migration: "MaiBot 迁移",
       };
       const SCHEMA_ZH = {
         web_json: "Web JSON",
         script_json: "脚本 JSON",
-        lpmm_openie: "LPMM OpenIE",
         plain_text: "纯文本",
       };
       const SOURCE_ZH = {
         upload: "上传文件",
         paste: "粘贴导入",
         raw_scan: "本地扫描",
-        lpmm_openie: "LPMM OpenIE",
-        lpmm_convert: "LPMM 转换",
         temporal_backfill: "时序回填",
         maibot_migration: "MaiBot 迁移",
       };
@@ -1176,11 +1145,11 @@ Content-Type: application/json
         const subtitleEl = $("page-subtitle");
         if (subtitleEl) {
           subtitleEl.textContent = hasImportBackend()
-            ? "旧版 Web 导入工作台已接入，可在当前页面执行上传、扫描和任务查看。"
-            : "宿主导入兼容页；当前只展示真实可用入口与接入说明，不再暴露旧版无后端承接的任务面板。";
+            ? "宿主导入工作台"
+            : "宿主导入兼容页；当前只展示真实可用入口与接入说明，不再暴露无后端承接的任务面板。";
         }
         if (statusEl) {
-          statusEl.textContent = `${message} 当前页面不会再展示旧版上传、本地扫描、OpenIE、回填和任务队列壳面板。`;
+          statusEl.textContent = `${message} 当前页面不会再展示上传、本地扫描、粘贴导入、回填和任务队列壳面板。`;
         }
         if (modesEl) {
           modesEl.innerHTML = [
@@ -1228,7 +1197,6 @@ Content-Type: application/json
           "upload-submit",
           "paste-submit",
           "raw-submit",
-          "openie-submit",
           "backfill-submit",
           "refresh-btn",
           "cancel-btn",
@@ -1326,7 +1294,7 @@ Content-Type: application/json
         } catch (e) {
           $("guide-meta").textContent = "来源: 兼容页内置说明（桥接文档端点不可用）";
           $("guide-body").innerHTML = renderGuideMarkdown(
-            `${IMPORT_COMPAT_GUIDE}\n\n> 附加说明：旧版文档桥接端点当前不可用，已自动回退到内置兼容说明。`,
+            `${IMPORT_COMPAT_GUIDE}\n\n> 附加说明：导入文档桥接端点当前不可用，已自动回退到内置兼容说明。`,
           );
         }
       }
@@ -1388,11 +1356,7 @@ Content-Type: application/json
               )
               .join("")
           : `<option value="">(无可用路径别名)</option>`;
-        [
-          "raw-alias",
-          "openie-alias",
-          "backfill-alias",
-        ].forEach((id) => {
+        ["raw-alias", "backfill-alias"].forEach((id) => {
           const el = $(id);
           if (!el) return;
           const old = el.value;
@@ -1400,8 +1364,6 @@ Content-Type: application/json
           if (old && keys.includes(old)) el.value = old;
           if (!el.value) {
             if (id === "raw-alias" && keys.includes("raw")) el.value = "raw";
-            else if (id === "openie-alias" && keys.includes("lpmm"))
-              el.value = "lpmm";
             else if (id === "backfill-alias" && keys.includes("plugin_data"))
               el.value = "plugin_data";
           }
@@ -1630,22 +1592,6 @@ Content-Type: application/json
         toast("本地扫描任务已创建");
       }
 
-      async function createLpmmOpenieTask() {
-        const payload = {
-          ...commonParams(),
-          alias: $("openie-alias").value,
-          relative_path: ($("openie-relative-path").value || "").trim(),
-          include_all_json: !!$("openie-include-all").checked,
-        };
-        const d = await req("/api/import/tasks/lpmm_openie", {
-          method: "POST",
-          headers: headers(true),
-          body: JSON.stringify(payload),
-        });
-        if (d?.task?.task_id) state.taskId = d.task.task_id;
-        toast("LPMM OpenIE 任务已创建");
-      }
-
       async function createTemporalBackfillTask() {
         const payload = {
           alias: $("backfill-alias").value,
@@ -1745,7 +1691,6 @@ Content-Type: application/json
           "upload",
           "paste",
           "raw",
-          "openie",
           "backfill",
         ];
         const activateTab = (name) => {
@@ -1755,7 +1700,7 @@ Content-Type: application/json
             if (tab) tab.classList.toggle("active", t === name);
             if (panel) panel.classList.toggle("active", t === name);
           });
-          if (["raw", "openie"].includes(name)) {
+          if (["raw"].includes(name)) {
             $("dedupe-policy").value = "manifest";
           } else if (["upload", "paste"].includes(name)) {
             $("dedupe-policy").value = "content_hash";
@@ -1806,14 +1751,6 @@ Content-Type: application/json
             await poll();
           } catch (e) {
             toast(`本地扫描失败: ${e.message}`);
-          }
-        };
-        $("openie-submit").onclick = async () => {
-          try {
-            await createLpmmOpenieTask();
-            await poll();
-          } catch (e) {
-            toast(`OpenIE 导入失败: ${e.message}`);
           }
         };
         $("backfill-submit").onclick = async () => {

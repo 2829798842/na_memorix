@@ -9,25 +9,20 @@
 - 维护记忆图谱，支持边权调整、冻结、恢复、强化、保护等操作。
 - 为 Agent 自动注入记忆上下文。
 - 提供人物画像查询、覆盖和注册表管理。
-- 提供 Web 可视化界面，用于浏览图谱、查看来源、管理记忆和触发重建索引。
-- 暴露兼容的 `/api/*` 图谱接口与 `/v1/*` 检索/任务接口，便于前端和旧调用链继续工作。
-  其中导入相关的 `/v1/import/tasks` 当前主要提供创建任务与单任务查询。
-- `import` 与 `tuning` 页面当前仍是宿主兼容页，正式后端桥接尚未接入；未接入时页面会自动切换为兼容说明模式。
+- 提供 Web 可视化界面，用于浏览图谱、查看来源、管理记忆和触发重建索引。11
+- 暴露兼容的 `/api/*` 与 `/v1/*` 接口，便于前端和旧调用链继续工作。
 
 ## Web 界面入口
 
 - [打开统一入口页](/plugins/litroenade.na_memorix/launcher)
 - [打开主面板](/plugins/litroenade.na_memorix/)
-- [打开导入中心（兼容页）](/plugins/litroenade.na_memorix/import)
-  当前未接入时会提示改走 `/v1/import/tasks`
-- [打开检索调优（兼容页）](/plugins/litroenade.na_memorix/tuning)
-  当前未接入时只展示接入状态与替代入口
+- [打开导入中心](/plugins/litroenade.na_memorix/import)
+- [打开检索调优](/plugins/litroenade.na_memorix/tuning)
 - [项目仓库](https://github.com/2829798842/na_memorix)
 
 ### 存储后端
-
-- 元数据后端：PostgreSQL
-- 向量后端：Qdrant
+ 
+ 
 - 图快照：持久化到 PostgreSQL 图表；本地旧图文件仅作为兼容迁移输入
 - 稀疏检索默认后端：PostgreSQL
 

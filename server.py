@@ -3,17 +3,21 @@
 import asyncio
 import json
 import threading
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from amemorix.common.logging import get_logger
 from amemorix.settings import mask_sensitive
+
+from .import_backend import ImportBackend, resolve_local_plugin_data_dir
+from .retrieval_tuning_backend import RetrievalTuningBackend
 
 logger = get_logger("A_Memorix.Server")
 
@@ -105,6 +109,66 @@ class ReindexRequest(BaseModel):
     """
 
     batch_size: int = 32
+
+
+class RetrievalTuningProfileApplyRequest(BaseModel):
+    """检索调优 profile 应用请求。"""
+
+    profile: Dict[str, Any] = Field(default_factory=dict)
+    reason: str = "web_manual_apply"
+
+
+class RetrievalTuningTaskCreateRequest(BaseModel):
+    """检索调优任务创建请求。"""
+
+    objective: str = "balanced"
+    intensity: str = "standard"
+    rounds: Optional[int] = Field(default=None, ge=1, le=200)
+    sample_size: int = Field(default=24, ge=4, le=500)
+    top_k_eval: int = Field(default=20, ge=5, le=100)
+    llm_enabled: bool = True
+
+
+class ImportCommonTaskRequest(BaseModel):
+    """导入中心公共任务参数。"""
+
+    file_concurrency: int = Field(default=2, ge=1, le=6)
+    chunk_concurrency: int = Field(default=4, ge=1, le=12)
+    llm_enabled: bool = True
+    strategy_override: str = ""
+    dedupe_policy: str = "content_hash"
+    chat_log: bool = False
+    chat_reference_time: Optional[str] = None
+    force: bool = False
+    clear_manifest: bool = False
+
+
+class ImportPasteTaskRequest(ImportCommonTaskRequest):
+    """粘贴导入任务请求。"""
+
+    input_mode: str = "text"
+    content: str
+    name: str = ""
+
+
+class ImportRawScanTaskRequest(ImportCommonTaskRequest):
+    """本地扫描任务请求。"""
+
+    alias: str
+    relative_path: str = ""
+    glob: str = "*"
+    recursive: bool = True
+    input_mode: str = "text"
+
+
+class ImportTemporalBackfillTaskRequest(BaseModel):
+    """时序回填任务请求。"""
+
+    alias: str = ""
+    relative_path: str = ""
+    dry_run: bool = False
+    no_created_fallback: bool = False
+    limit: int = Field(default=100000, ge=1, le=200000)
 
 class SourceListRequest(BaseModel):
     """来源筛选请求。
@@ -205,6 +269,8 @@ class MemorixServer:
         self._server = None
         self._server = None
         self.should_exit = False
+        self._import_backend = ImportBackend(plugin_instance=self.plugin)
+        self._retrieval_tuning_backend = RetrievalTuningBackend(plugin_instance=self.plugin)
         
         # 缓存关系谓词映射
         self._relation_cache = None
@@ -343,6 +409,11 @@ class MemorixServer:
                     status_code=403,
                     detail=f"Web 面板当前处于只读模式，禁止{action}",
                 )
+
+        def _raise_import_backend_error(exc: ValueError) -> None:
+            if str(exc) in {"Task not found", "File not found"}:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         @self.app.middleware("http")
         async def _runtime_middleware(request, call_next):
@@ -1510,6 +1581,283 @@ class MemorixServer:
                 raise HTTPException(status_code=404, detail="Task not found")
             return task
 
+        @self.app.get("/api/import/guide")
+        async def get_import_guide():
+            try:
+                return await self._import_backend.get_guide()
+            except Exception as exc:
+                logger.error("Get import guide failed: %s", exc, exc_info=True)
+                raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+        @self.app.get("/api/import/tasks")
+        async def list_import_tasks(limit: int = Query(default=80, ge=1, le=200)):
+            try:
+                return await self._import_backend.list_tasks(limit=limit)
+            except Exception as exc:
+                logger.error("List import tasks failed: %s", exc, exc_info=True)
+                raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+        @self.app.post("/api/import/tasks/upload")
+        async def create_import_upload_task(
+            files: List[UploadFile] = File(alias="files[]"),
+            payload: str = Form(default="{}"),
+        ):
+            _ensure_web_write_allowed("创建上传导入任务")
+            try:
+                payload_data = json.loads(payload or "{}")
+            except json.JSONDecodeError as exc:
+                raise HTTPException(status_code=400, detail=f"payload 不是合法 JSON: {exc}") from exc
+            if not isinstance(payload_data, dict):
+                raise HTTPException(status_code=400, detail="payload 必须是 JSON 对象")
+            if not files:
+                raise HTTPException(status_code=400, detail="上传文件列表不能为空")
+
+            upload_batch_id = uuid.uuid4().hex
+            upload_root = (
+                resolve_local_plugin_data_dir(__file__)
+                / "runtime"
+                / "import_backend"
+                / "uploads"
+                / upload_batch_id
+            )
+            await asyncio.to_thread(upload_root.mkdir, parents=True, exist_ok=True)
+
+            saved_files: list[dict[str, Any]] = []
+            for index, upload in enumerate(files):
+                file_name = Path(str(upload.filename or f"upload_{index}.txt")).name
+                target_path = upload_root / file_name
+                if target_path.exists():
+                    target_path = upload_root / f"{index}_{file_name}"
+                content = await upload.read()
+                await asyncio.to_thread(target_path.write_bytes, content)
+                saved_files.append({"name": target_path.name, "path": str(target_path)})
+
+            try:
+                return await self._import_backend.create_upload_task(
+                    saved_files=saved_files,
+                    payload=payload_data,
+                )
+            except ValueError as exc:
+                _raise_import_backend_error(exc)
+            except Exception as exc:
+                logger.error("Create import upload task failed: %s", exc, exc_info=True)
+                raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+        @self.app.post("/api/import/tasks/paste")
+        async def create_import_paste_task(data: ImportPasteTaskRequest):
+            _ensure_web_write_allowed("创建粘贴导入任务")
+            try:
+                return await self._import_backend.create_paste_task(data.model_dump())
+            except ValueError as exc:
+                _raise_import_backend_error(exc)
+            except Exception as exc:
+                logger.error("Create import paste task failed: %s", exc, exc_info=True)
+                raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+        @self.app.post("/api/import/tasks/raw_scan")
+        async def create_import_raw_scan_task(data: ImportRawScanTaskRequest):
+            _ensure_web_write_allowed("创建本地扫描任务")
+            try:
+                return await self._import_backend.create_raw_scan_task(data.model_dump())
+            except ValueError as exc:
+                _raise_import_backend_error(exc)
+            except Exception as exc:
+                logger.error("Create import raw scan task failed: %s", exc, exc_info=True)
+                raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+        @self.app.post("/api/import/tasks/temporal_backfill")
+        async def create_import_temporal_backfill_task(data: ImportTemporalBackfillTaskRequest):
+            _ensure_web_write_allowed("创建时序回填任务")
+            try:
+                return await self._import_backend.create_temporal_backfill_task(data.model_dump())
+            except ValueError as exc:
+                _raise_import_backend_error(exc)
+            except Exception as exc:
+                logger.error("Create temporal backfill task failed: %s", exc, exc_info=True)
+                raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+        @self.app.get("/api/import/tasks/{task_id}")
+        async def get_import_task(task_id: str):
+            try:
+                return await self._import_backend.get_task(task_id)
+            except ValueError as exc:
+                _raise_import_backend_error(exc)
+            except Exception as exc:
+                logger.error("Get import task failed: %s", exc, exc_info=True)
+                raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+        @self.app.get("/api/import/tasks/{task_id}/files/{file_id}/chunks")
+        async def get_import_task_chunks(
+            task_id: str,
+            file_id: str,
+            offset: int = Query(default=0, ge=0),
+            limit: int = Query(default=100, ge=1, le=500),
+        ):
+            try:
+                return await self._import_backend.get_task_chunks(
+                    task_id,
+                    file_id,
+                    offset=offset,
+                    limit=limit,
+                )
+            except ValueError as exc:
+                _raise_import_backend_error(exc)
+            except Exception as exc:
+                logger.error("Get import task chunks failed: %s", exc, exc_info=True)
+                raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+        @self.app.post("/api/import/tasks/{task_id}/cancel")
+        async def cancel_import_task(task_id: str):
+            _ensure_web_write_allowed("取消导入任务")
+            try:
+                return await self._import_backend.cancel_task(task_id)
+            except ValueError as exc:
+                _raise_import_backend_error(exc)
+            except Exception as exc:
+                logger.error("Cancel import task failed: %s", exc, exc_info=True)
+                raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+        @self.app.post("/api/import/tasks/{task_id}/retry_failed")
+        async def retry_failed_import_task(task_id: str, data: ImportCommonTaskRequest):
+            _ensure_web_write_allowed("重试导入任务失败分块")
+            try:
+                return await self._import_backend.retry_failed(task_id, data.model_dump())
+            except ValueError as exc:
+                _raise_import_backend_error(exc)
+            except Exception as exc:
+                logger.error("Retry failed import task failed: %s", exc, exc_info=True)
+                raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+        @self.app.get("/api/retrieval_tuning/profile")
+        async def get_retrieval_tuning_profile():
+            try:
+                return await self._retrieval_tuning_backend.get_profile()
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except Exception as exc:
+                logger.error("Get retrieval tuning profile failed: %s", exc, exc_info=True)
+                raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+        @self.app.post("/api/retrieval_tuning/profile/apply")
+        async def apply_retrieval_tuning_profile(data: RetrievalTuningProfileApplyRequest):
+            _ensure_web_write_allowed("应用检索调优参数")
+            try:
+                return await self._retrieval_tuning_backend.apply_profile(data.profile, reason=data.reason)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except Exception as exc:
+                logger.error("Apply retrieval tuning profile failed: %s", exc, exc_info=True)
+                raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+        @self.app.post("/api/retrieval_tuning/profile/rollback")
+        async def rollback_retrieval_tuning_profile():
+            _ensure_web_write_allowed("回滚检索调优参数")
+            try:
+                return await self._retrieval_tuning_backend.rollback_profile()
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except Exception as exc:
+                logger.error("Rollback retrieval tuning profile failed: %s", exc, exc_info=True)
+                raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+        @self.app.get("/api/retrieval_tuning/profile/export_toml")
+        async def export_retrieval_tuning_profile():
+            try:
+                return await self._retrieval_tuning_backend.export_profile_toml()
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except Exception as exc:
+                logger.error("Export retrieval tuning profile failed: %s", exc, exc_info=True)
+                raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+        @self.app.get("/api/retrieval_tuning/tasks")
+        async def list_retrieval_tuning_tasks(limit: int = Query(default=100, ge=1, le=200)):
+            try:
+                return await self._retrieval_tuning_backend.list_tasks(limit=limit)
+            except Exception as exc:
+                logger.error("List retrieval tuning tasks failed: %s", exc, exc_info=True)
+                raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+        @self.app.post("/api/retrieval_tuning/tasks")
+        async def create_retrieval_tuning_task(data: RetrievalTuningTaskCreateRequest):
+            _ensure_web_write_allowed("创建检索调优任务")
+            try:
+                return await self._retrieval_tuning_backend.create_task(data.model_dump())
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except Exception as exc:
+                logger.error("Create retrieval tuning task failed: %s", exc, exc_info=True)
+                raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+        @self.app.get("/api/retrieval_tuning/tasks/{task_id}")
+        async def get_retrieval_tuning_task(task_id: str):
+            try:
+                return await self._retrieval_tuning_backend.get_task(task_id)
+            except ValueError as exc:
+                if str(exc) == "Task not found":
+                    raise HTTPException(status_code=404, detail=str(exc)) from exc
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except Exception as exc:
+                logger.error("Get retrieval tuning task failed: %s", exc, exc_info=True)
+                raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+        @self.app.get("/api/retrieval_tuning/tasks/{task_id}/rounds")
+        async def get_retrieval_tuning_task_rounds(
+            task_id: str,
+            offset: int = Query(default=0, ge=0),
+            limit: int = Query(default=100, ge=1, le=500),
+        ):
+            try:
+                return await self._retrieval_tuning_backend.get_task_rounds(task_id, offset=offset, limit=limit)
+            except ValueError as exc:
+                if str(exc) == "Task not found":
+                    raise HTTPException(status_code=404, detail=str(exc)) from exc
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except Exception as exc:
+                logger.error("Get retrieval tuning task rounds failed: %s", exc, exc_info=True)
+                raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+        @self.app.get("/api/retrieval_tuning/tasks/{task_id}/report")
+        async def get_retrieval_tuning_task_report(
+            task_id: str,
+            format: str = Query(default="md"),
+        ):
+            try:
+                return await self._retrieval_tuning_backend.get_task_report(task_id, report_format=format)
+            except ValueError as exc:
+                if str(exc) == "Task not found":
+                    raise HTTPException(status_code=404, detail=str(exc)) from exc
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except Exception as exc:
+                logger.error("Get retrieval tuning task report failed: %s", exc, exc_info=True)
+                raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+        @self.app.post("/api/retrieval_tuning/tasks/{task_id}/cancel")
+        async def cancel_retrieval_tuning_task(task_id: str):
+            _ensure_web_write_allowed("取消检索调优任务")
+            try:
+                return await self._retrieval_tuning_backend.cancel_task(task_id)
+            except ValueError as exc:
+                if str(exc) == "Task not found":
+                    raise HTTPException(status_code=404, detail=str(exc)) from exc
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except Exception as exc:
+                logger.error("Cancel retrieval tuning task failed: %s", exc, exc_info=True)
+                raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+        @self.app.post("/api/retrieval_tuning/tasks/{task_id}/apply_best")
+        async def apply_best_retrieval_tuning_profile(task_id: str):
+            _ensure_web_write_allowed("应用最优检索调优参数")
+            try:
+                return await self._retrieval_tuning_backend.apply_best_profile(task_id)
+            except ValueError as exc:
+                if str(exc) == "Task not found":
+                    raise HTTPException(status_code=404, detail=str(exc)) from exc
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except Exception as exc:
+                logger.error("Apply best retrieval tuning profile failed: %s", exc, exc_info=True)
+                raise HTTPException(status_code=500, detail=str(exc)) from exc
+
         @self.app.get("/api/config")
         async def get_config():
             """获取配置（脱敏只读）"""
@@ -1544,12 +1892,12 @@ class MemorixServer:
                 },
                 "features": {
                     "compat_graph_ui": True,
-                    "import_backend": False,
-                    "retrieval_tuning_backend": False,
+                    "import_backend": True,
+                    "retrieval_tuning_backend": True,
                 },
                 "messages": {
-                    "import_backend": "宿主导入后端暂未接入，导入页已切换为兼容说明模式；基础异步导入可改用 /v1/import/tasks。",
-                    "retrieval_tuning_backend": "宿主检索调优后端暂未接入，调优页已切换为兼容说明模式。",
+                    "import_backend": "宿主导入后端已接入，可直接在当前页面执行上传、扫描、粘贴导入、时序回填与任务查看。",
+                    "retrieval_tuning_backend": "宿主检索调优后端已接入，可直接在当前页面执行参数应用、自动调优与报告查看。",
                 },
                 "web_read_only": bool(self.plugin.get_config("web.read_only", False)),
             }

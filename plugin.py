@@ -6,6 +6,7 @@ import hashlib
 import importlib
 import json
 import sys
+import threading
 from contextlib import asynccontextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
@@ -46,7 +47,7 @@ plugin = NekroPlugin(
     sleep_brief="用于长期记忆检索、图谱知识导入与当前聊天上下文的自动记忆注入。",
 )
 
-_PROJECT_REPO_URL = "https://github.com/2829798842/na_memorix"
+_PROJECT_REPO_URL = "https://github.com/litroenade/na_memorix"
 _WEB_PANEL_ROOT = f"/plugins/{plugin.key}/"
 _WEB_PANEL_LAUNCHER = f"{_WEB_PANEL_ROOT}launcher"
 plugin.url = _WEB_PANEL_LAUNCHER
@@ -480,6 +481,9 @@ _runtime_handle: Optional[RuntimeHandle] = None
 _runtime_lock = asyncio.Lock()
 _bound_runtime_context: ContextVar[Optional[Any]] = ContextVar("na_memorix_bound_runtime_context", default=None)
 _runtime_sync_task: Optional[asyncio.Task[Any]] = None
+_runtime_tuning_overlay_lock = threading.RLock()
+_runtime_tuning_overlay: dict[str, Any] = {}
+_runtime_tuning_overlay_history: list[dict[str, Any]] = []
 _RUNTIME_SYNC_INTERVAL_SECONDS = 2.0
 
 
@@ -607,10 +611,45 @@ def _build_settings_dict(config_obj: NaMemorixConfig) -> dict[str, Any]:
     return _deep_merge(DEFAULT_CONFIG, overlay)
 
 
+def get_runtime_tuning_overlay() -> dict[str, Any]:
+    """返回当前运行时调优覆盖层。"""
+
+    with _runtime_tuning_overlay_lock:
+        return copy.deepcopy(_runtime_tuning_overlay)
+
+
+def apply_runtime_tuning_profile_patch(patch: dict[str, Any], *, push_history: bool = True) -> dict[str, Any]:
+    """把调优 patch 叠加到当前运行时覆盖层。"""
+
+    normalized_patch = copy.deepcopy(patch or {})
+    with _runtime_tuning_overlay_lock:
+        global _runtime_tuning_overlay
+        if push_history:
+            _runtime_tuning_overlay_history.append(copy.deepcopy(_runtime_tuning_overlay))
+            if len(_runtime_tuning_overlay_history) > 20:
+                _runtime_tuning_overlay_history.pop(0)
+        _runtime_tuning_overlay = _deep_merge(_runtime_tuning_overlay, normalized_patch)
+        return copy.deepcopy(_runtime_tuning_overlay)
+
+
+def rollback_runtime_tuning_profile() -> Optional[dict[str, Any]]:
+    """回滚到上一份运行时调优覆盖层。"""
+
+    with _runtime_tuning_overlay_lock:
+        global _runtime_tuning_overlay
+        if not _runtime_tuning_overlay_history:
+            return None
+        _runtime_tuning_overlay = _runtime_tuning_overlay_history.pop()
+        return copy.deepcopy(_runtime_tuning_overlay)
+
+
 def build_settings() -> AppSettings:
     """根据插件配置面构建 runtime 的最终配置。"""
 
     settings_config = _build_settings_dict(plugin.get_config(NaMemorixConfig))
+    runtime_overlay = get_runtime_tuning_overlay()
+    if runtime_overlay:
+        settings_config = _deep_merge(settings_config, runtime_overlay)
     return AppSettings(config=settings_config, config_path=None)
 
 
@@ -953,6 +992,9 @@ class RuntimeProxy:
     def sparse_index(self) -> Any:
         ctx = self._ctx()
         return ctx.sparse_index if ctx is not None else None
+
+    def get_plugin_data_dir(self) -> Path:
+        return plugin.get_plugin_data_dir()
 
     @property
     def retriever(self) -> Any:

@@ -250,7 +250,7 @@
       <div class="top">
         <div>
           <div class="title">A_Memorix 检索调优中心</div>
-          <div class="sub" id="page-subtitle">宿主检索调优兼容页；只有在 retrieval_tuning_backend 接入后才会恢复旧版调优工作台</div>
+          <div class="sub" id="page-subtitle">宿主检索调优中心</div>
         </div>
         <div class="btns">
           <button class="btn" onclick="window.open(pageUrl('launcher'), '_blank')">打开入口页</button>
@@ -599,7 +599,7 @@
         const exampleEl = document.getElementById("compat-request-example");
         if (subtitleEl) {
           subtitleEl.textContent = hasTuningBackend()
-            ? "旧版调优工作台已接入，可在当前页面执行参数应用、自动调优和报告查看。"
+            ? "宿主检索调优工作台"
             : "宿主检索调优兼容页；当前只展示真实能力状态与替代入口，不再暴露无后端承接的调优面板。";
         }
         if (statusEl) {
@@ -609,7 +609,7 @@
           stepsEl.innerHTML = [
             ["先做什么", "优先从主面板确认图谱、来源和人物画像是否正常。"],
             ["怎么看状态", "通过 /api/ui_capabilities 确认 retrieval_tuning_backend 是否已接入。"],
-            ["接入后恢复", "一旦宿主补齐 /api/retrieval_tuning/*，此页会自动恢复旧版工作台。"],
+            ["接入后恢复", "一旦宿主补齐 /api/retrieval_tuning/*，此页会自动恢复完整调优工作台。"],
           ]
             .map(
               ([title, desc]) => `
