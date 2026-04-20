@@ -27,7 +27,7 @@ from amemorix.common.logging import bind_plugin_logger
 from amemorix.services import ImportService, QueryService, SummaryService
 from amemorix.settings import AppSettings, DEFAULT_CONFIG, _deep_merge
 
-from .native_memory_sync import filter_native_results_for_workspace, sync_builtin_memories
+from .builtin_memory_sync import filter_results_for_scope, sync_builtin_memories
 from .core.utils.runtime_dependencies import get_runtime_dependency_report
 
 sys.modules.setdefault("server", importlib.import_module(f"{__package__}.server"))
@@ -1153,6 +1153,20 @@ async def _sync_builtin_memory_for_ctx(_ctx: AgentCtx, ctx: Any, cfg: NaMemorixC
     return workspace_id
 
 
+async def _filter_results_for_ctx(
+    _ctx: AgentCtx,
+    ctx: Any,
+    results: list[dict[str, Any]],
+    workspace_id: int | None,
+) -> list[dict[str, Any]]:
+    return await filter_results_for_scope(
+        ctx=ctx,
+        results=list(results or []),
+        workspace_id=workspace_id,
+        chat_key=str(_ctx.from_chat_key or "").strip(),
+    )
+
+
 @plugin.mount_prompt_inject_method("na_memorix_prompt")
 async def na_memorix_prompt(_ctx: AgentCtx) -> str:
     cfg = plugin.get_config(NaMemorixConfig)
@@ -1175,7 +1189,9 @@ async def na_memorix_prompt(_ctx: AgentCtx) -> str:
 
         service = QueryService(ctx)
         result = await service.search(query=query_text, top_k=int(cfg.AUTO_INJECT_TOP_K))
-        filtered_results = filter_native_results_for_workspace(
+        filtered_results = await _filter_results_for_ctx(
+            _ctx,
+            ctx,
             list(result.get("results", [])),
             workspace_id,
         )
@@ -1207,7 +1223,12 @@ async def memorix_search(_ctx: AgentCtx, query: str, top_k: int = 5):
         cfg = plugin.get_config(NaMemorixConfig)
         workspace_id = await _sync_builtin_memory_for_ctx(_ctx, ctx, cfg)
         result = await QueryService(ctx).search(query=query, top_k=top_k)
-        result["results"] = filter_native_results_for_workspace(list(result.get("results", [])), workspace_id)
+        result["results"] = await _filter_results_for_ctx(
+            _ctx,
+            ctx,
+            list(result.get("results", [])),
+            workspace_id,
+        )
         result["count"] = len(result["results"])
         return result
 

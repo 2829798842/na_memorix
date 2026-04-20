@@ -78,6 +78,12 @@ class SummaryImporter:
             lines.append(f"{role}: {content}")
         return "\n".join(lines)
 
+    def _build_source_metadata(self, *, stream_id: str, source: str) -> Dict[str, Any]:
+        metadata: Dict[str, Any] = {"record_source": source}
+        if str(source or "").startswith("chat_summary:"):
+            metadata["chat_summary_chat_key"] = str(stream_id or "").strip()
+        return metadata
+
     def _fallback_summary(self, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
         merged = " ".join(str(m.get("content", "") or "").strip() for m in messages if str(m.get("content", "")).strip())
         merged = merged[:500]
@@ -144,6 +150,7 @@ class SummaryImporter:
                 entities=entities if isinstance(entities, list) else [],
                 relations=relations if isinstance(relations, list) else [],
                 stream_id=session["session_id"],
+                source=source or f"chat_summary:{session['session_id']}",
             )
 
             self.vector_store.save()
@@ -177,16 +184,20 @@ class SummaryImporter:
         entities: List[str],
         relations: List[Dict[str, str]],
         stream_id: str,
+        source: str,
         time_meta: Optional[Dict[str, Any]] = None,
     ) -> None:
         type_str = self._cfg("summarization.default_knowledge_type", "narrative")
         knowledge_type = get_knowledge_type_from_string(type_str) or KnowledgeType.NARRATIVE
+        source_name = str(source or f"chat_summary:{stream_id}").strip() or f"chat_summary:{stream_id}"
+        source_metadata = self._build_source_metadata(stream_id=stream_id, source=source_name)
 
         hash_value = self.metadata_store.add_paragraph(
             content=summary,
-            source=f"chat_summary:{stream_id}",
+            source=source_name,
             knowledge_type=knowledge_type.value,
             time_meta=time_meta,
+            metadata=source_metadata,
         )
 
         embedding = await self.embedding_manager.encode(summary)
@@ -207,6 +218,7 @@ class SummaryImporter:
                 obj=o,
                 confidence=1.0,
                 source_paragraph=hash_value,
+                metadata=source_metadata,
             )
             self.graph_store.add_edges([(s, o)], relation_hashes=[rel_hash])
 

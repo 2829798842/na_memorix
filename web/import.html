@@ -577,11 +577,11 @@
               <div class="tabs">
                 <button id="tab-upload" class="active">上传文件</button>
                 <button id="tab-paste">粘贴导入</button>
-                <button id="tab-raw">本地扫描</button>
+                <button id="tab-auto">自动迁移记忆</button>
                 <button id="tab-backfill">时序回填</button>
               </div>
 
-              <div class="row3">
+              <div class="row3" id="common-tuning-row">
                 <div>
                   <label>文件并发</label>
                   <input
@@ -612,7 +612,7 @@
                   </select>
                 </div>
               </div>
-              <div class="row3">
+              <div class="row3" id="common-options-row">
                 <div>
                   <label>去重策略</label>
                   <select id="dedupe-policy">
@@ -632,7 +632,7 @@
                 </div>
                 <div></div>
               </div>
-              <div class="checkgrid tiny">
+              <div class="checkgrid tiny" id="common-flag-grid">
                 <label class="checkline">
                   <input id="llm-enabled" type="checkbox" checked />
                   <span>启用 LLM 抽取</span>
@@ -708,40 +708,45 @@
                 </div>
               </div>
 
-              <div id="panel-raw" class="panel">
+              <div id="panel-auto" class="panel">
+                <div class="row">
+                  <label class="checkline tiny" style="margin-top: 20px">
+                    <input id="auto-import-builtin" type="checkbox" checked />
+                    <span>导入宿主原生记忆</span>
+                  </label>
+                  <label class="checkline tiny" style="margin-top: 20px">
+                    <input id="auto-import-chat" type="checkbox" checked />
+                    <span>导入已存聊天记录总结</span>
+                  </label>
+                </div>
                 <div class="row">
                   <div>
-                    <label>路径别名</label>
-                    <select id="raw-alias"></select>
+                    <label>频道处理上限</label>
+                    <input
+                      id="auto-chat-limit"
+                      type="number"
+                      min="1"
+                      max="200"
+                      value="20"
+                    />
                   </div>
                   <div>
-                    <label>相对路径（relative_path）</label>
+                    <label>每频道消息窗口</label>
                     <input
-                      id="raw-relative-path"
-                      placeholder="raw 子目录（可选）"
+                      id="auto-message-window"
+                      type="number"
+                      min="4"
+                      max="200"
+                      value="50"
                     />
                   </div>
                 </div>
-                <div class="row3">
-                  <div>
-                    <label>匹配规则（glob）</label>
-                    <input id="raw-glob" value="*" />
-                  </div>
-                  <div>
-                    <label>输入模式</label>
-                    <select id="raw-input-mode">
-                      <option value="text">文本（text）</option>
-                      <option value="json">JSON（json）</option>
-                    </select>
-                  </div>
-                  <label class="checkline tiny" style="margin-top: 20px">
-                    <input id="raw-recursive" type="checkbox" checked />
-                    <span>递归扫描</span>
-                  </label>
+                <div class="tiny" style="margin-top: 8px">
+                  原生记忆迁移基本不消耗 token；聊天总结会调用总结模型，首次迁移或积压较多时可能耗费大量 token。
                 </div>
                 <div class="btns" style="margin-top: 8px">
-                  <button class="btn p" id="raw-submit">
-                    提交本地扫描任务
+                  <button class="btn p" id="auto-submit">
+                    提交自动迁移任务
                   </button>
                 </div>
               </div>
@@ -945,7 +950,7 @@
 
 ## 为什么旧表单现在不可用
 
-上传、本地扫描、粘贴导入、时序回填、任务队列、文件级状态、分块级状态这些面板，依赖的是导入页所需的 \`/api/import/*\` Web 桥接层，而不是当前已经接入的 \`/v1/import/tasks\`。
+上传、自动迁移、粘贴导入、时序回填、任务队列、文件级状态、分块级状态这些面板，依赖的是导入页所需的 \`/api/import/*\` Web 桥接层，而不是当前已经接入的 \`/v1/import/tasks\`。
 
 后续如果宿主补齐对应桥接后端，这个页面会自动恢复成完整导入工作台。`;
       const IMPORT_COMPAT_REQUEST_EXAMPLE = `POST /v1/import/tasks
@@ -1009,6 +1014,7 @@ Content-Type: application/json
         converting: "转换中",
         verifying: "校验中",
         switching: "切换中",
+        migrating: "迁移中",
         backfilling: "回填中",
         cancel_requested: "取消中",
         cancelled: "已取消",
@@ -1023,11 +1029,14 @@ Content-Type: application/json
         quote: "引用",
         json: "JSON",
         text: "文本",
+        builtin_sync: "原生记忆同步",
+        chat_summary: "聊天总结迁移",
       };
       const TASK_KIND_ZH = {
         upload: "上传文件",
         paste: "粘贴导入",
         raw_scan: "本地扫描",
+        auto_migrate: "自动迁移记忆",
         temporal_backfill: "时序回填",
         maibot_migration: "MaiBot 迁移",
       };
@@ -1040,6 +1049,7 @@ Content-Type: application/json
         upload: "上传文件",
         paste: "粘贴导入",
         raw_scan: "本地扫描",
+        auto_migrate: "自动迁移记忆",
         temporal_backfill: "时序回填",
         maibot_migration: "MaiBot 迁移",
       };
@@ -1142,7 +1152,7 @@ Content-Type: application/json
             : "宿主导入兼容页；当前只展示真实可用入口与接入说明，不再暴露无后端承接的任务面板。";
         }
         if (statusEl) {
-          statusEl.textContent = `${message} 当前页面不会再展示上传、本地扫描、粘贴导入、回填和任务队列壳面板。`;
+          statusEl.textContent = `${message} 当前页面不会再展示上传、自动迁移、粘贴导入、回填和任务队列壳面板。`;
         }
         if (modesEl) {
           modesEl.innerHTML = [
@@ -1189,7 +1199,6 @@ Content-Type: application/json
         const disabledIds = [
           "upload-submit",
           "paste-submit",
-          "raw-submit",
           "backfill-submit",
           "refresh-btn",
           "cancel-btn",
@@ -1349,15 +1358,14 @@ Content-Type: application/json
               )
               .join("")
           : `<option value="">(无可用路径别名)</option>`;
-        ["raw-alias", "backfill-alias"].forEach((id) => {
+        ["backfill-alias"].forEach((id) => {
           const el = $(id);
           if (!el) return;
           const old = el.value;
           el.innerHTML = html;
           if (old && keys.includes(old)) el.value = old;
           if (!el.value) {
-            if (id === "raw-alias" && keys.includes("raw")) el.value = "raw";
-            else if (id === "backfill-alias" && keys.includes("plugin_data"))
+            if (id === "backfill-alias" && keys.includes("plugin_data"))
               el.value = "plugin_data";
           }
         });
@@ -1567,22 +1575,37 @@ Content-Type: application/json
         toast("粘贴任务已创建");
       }
 
-      async function createRawScanTask() {
+      async function createAutoMigrateTask() {
+        const importBuiltin = !!$("auto-import-builtin").checked;
+        const importChat = !!$("auto-import-chat").checked;
+        if (!importBuiltin && !importChat) {
+          toast("请至少启用一种自动迁移来源");
+          return;
+        }
+        if (
+          !confirm(
+            "自动迁移会读取已存储聊天记录并调用总结模型，首次导入或积压较多时可能耗费大量 token，并持续较久。确定继续吗？",
+          )
+        ) {
+          return;
+        }
         const payload = {
           ...commonParams(),
-          alias: $("raw-alias").value,
-          relative_path: ($("raw-relative-path").value || "").trim(),
-          glob: ($("raw-glob").value || "*").trim() || "*",
-          recursive: !!$("raw-recursive").checked,
-          input_mode: $("raw-input-mode").value,
+          import_builtin_memory: importBuiltin,
+          import_chat_summary: importChat,
+          chat_limit: Math.max(1, Number($("auto-chat-limit").value || 20)),
+          message_window: Math.max(
+            4,
+            Number($("auto-message-window").value || 50),
+          ),
         };
-        const d = await req("/api/import/tasks/raw_scan", {
+        const d = await req("/api/import/tasks/auto_migrate", {
           method: "POST",
           headers: headers(true),
           body: JSON.stringify(payload),
         });
         if (d?.task?.task_id) state.taskId = d.task.task_id;
-        toast("本地扫描任务已创建");
+        toast("自动迁移任务已创建");
       }
 
       async function createTemporalBackfillTask() {
@@ -1683,7 +1706,7 @@ Content-Type: application/json
         const tabs = [
           "upload",
           "paste",
-          "raw",
+          "auto",
           "backfill",
         ];
         const activateTab = (name) => {
@@ -1693,9 +1716,11 @@ Content-Type: application/json
             if (tab) tab.classList.toggle("active", t === name);
             if (panel) panel.classList.toggle("active", t === name);
           });
-          if (["raw"].includes(name)) {
-            $("dedupe-policy").value = "manifest";
-          } else if (["upload", "paste"].includes(name)) {
+          const hideCommon = name === "auto";
+          $("common-tuning-row").hidden = hideCommon;
+          $("common-options-row").hidden = hideCommon;
+          $("common-flag-grid").hidden = hideCommon;
+          if (["upload", "paste"].includes(name)) {
             $("dedupe-policy").value = "content_hash";
           }
         };
@@ -1738,12 +1763,12 @@ Content-Type: application/json
             toast(`粘贴失败: ${e.message}`);
           }
         };
-        $("raw-submit").onclick = async () => {
+        $("auto-submit").onclick = async () => {
           try {
-            await createRawScanTask();
+            await createAutoMigrateTask();
             await poll();
           } catch (e) {
-            toast(`本地扫描失败: ${e.message}`);
+            toast(`自动迁移失败: ${e.message}`);
           }
         };
         $("backfill-submit").onclick = async () => {

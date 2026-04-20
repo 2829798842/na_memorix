@@ -8,9 +8,19 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from nekro_agent.models.db_chat_channel import DBChatChannel
+from nekro_agent.models.db_chat_message import DBChatMessage
+
+from amemorix.services import SummaryService
 from amemorix.common.logging import get_logger
 from core.utils.hash import compute_paragraph_hash
 from core.utils.time_parser import normalize_time_meta
+
+from .builtin_memory_sync import (
+    get_chat_import_cursor,
+    set_chat_import_cursor,
+    sync_builtin_memories,
+)
 
 logger = get_logger("A_Memorix.ImportBackend")
 
@@ -20,6 +30,9 @@ DEFAULT_MAX_FILE_CONCURRENCY = 6
 DEFAULT_MAX_CHUNK_CONCURRENCY = 12
 DEFAULT_FILE_CONCURRENCY = 2
 DEFAULT_CHUNK_CONCURRENCY = 4
+AUTO_MIGRATE_MIN_MESSAGES = 4
+AUTO_MIGRATE_DEFAULT_CHAT_LIMIT = 20
+AUTO_MIGRATE_DEFAULT_MESSAGE_WINDOW = 50
 SUPPORTED_TEXT_SUFFIXES = {".txt", ".md"}
 SUPPORTED_JSON_SUFFIXES = {".json"}
 SUPPORTED_IMPORT_SUFFIXES = SUPPORTED_TEXT_SUFFIXES | SUPPORTED_JSON_SUFFIXES
@@ -688,7 +701,7 @@ class ImportBackend:
                 "",
                 "- 上传文件：支持 `.txt` / `.md` / `.json`",
                 "- 粘贴导入：支持 text / json",
-                "- 本地扫描：按路径别名 + glob 扫描导入",
+                "- 自动迁移记忆：一键迁移宿主原生记忆与历史聊天总结",
                 "- 时序回填：从 JSON 时间字段或段落创建时间回填 event_time",
                 "",
                 "## 当前路径别名",
@@ -698,6 +711,7 @@ class ImportBackend:
                 "## 已知约束",
                 "",
                 "- `dedupe_policy`、`llm_enabled` 等参数目前仅做兼容接收，不会改变底层 ImportService 的写入语义。",
+                "- 自动迁移中的聊天总结会调用总结模型，首次迁移或积压较多时可能耗费较多 token。",
                 "- 时序回填优先消费提供的 JSON 时间字段；若没有可用字段且未禁用 created fallback，会回退到段落的 created_at。",
             ]
         )
@@ -863,45 +877,95 @@ class ImportBackend:
             forced_task_id=task_id,
         )
 
-    async def create_raw_scan_task(self, payload: dict[str, Any]) -> dict[str, Any]:
-        alias_map = self._path_aliases_paths()
-        target_path = resolve_alias_path(
-            alias_map,
-            str(payload.get("alias", "") or ""),
-            str(payload.get("relative_path", "") or ""),
-        )
-        files = await asyncio.to_thread(
-            discover_candidate_files,
-            target_path,
-            pattern=str(payload.get("glob", "*") or "*"),
-            recursive=bool(payload.get("recursive", True)),
-        )
-        if not files:
-            raise ValueError("没有发现可导入的文件")
-        input_mode = str(payload.get("input_mode", "text") or "text").strip().lower()
+    async def create_auto_migrate_task(self, payload: dict[str, Any]) -> dict[str, Any]:
+        from .plugin import NaMemorixConfig, plugin
+
+        import_builtin_memory = bool(payload.get("import_builtin_memory", True))
+        import_chat_summary = bool(payload.get("import_chat_summary", True))
+        if not import_builtin_memory and not import_chat_summary:
+            raise ValueError("至少需要启用一种自动迁移来源")
+
+        cfg = plugin.get_config(NaMemorixConfig)
+        chat_limit = max(1, min(200, int(payload.get("chat_limit", AUTO_MIGRATE_DEFAULT_CHAT_LIMIT) or AUTO_MIGRATE_DEFAULT_CHAT_LIMIT)))
+        message_window = max(4, min(200, int(payload.get("message_window", AUTO_MIGRATE_DEFAULT_MESSAGE_WINDOW) or AUTO_MIGRATE_DEFAULT_MESSAGE_WINDOW)))
         prepared_files: list[dict[str, Any]] = []
-        schema_detected = "plain_text"
-        for file_path in files:
-            relative_name = self._safe_display_path(target_path, file_path)
-            file_state, current_schema = await asyncio.to_thread(
-                self._prepare_file_from_path,
-                file_path=file_path,
-                display_name=relative_name,
-                source_name=f"raw_scan:{relative_name}",
-                input_mode=input_mode,
-                strategy_override=str(payload.get("strategy_override", "") or ""),
+
+        if import_builtin_memory:
+            workspace_channels = (
+                await DBChatChannel.filter(workspace_id__not_isnull=True)
+                .order_by("-update_time")
+                .all()
             )
-            prepared_files.append(file_state)
-            if current_schema == "web_json":
-                schema_detected = current_schema
+            seen_workspaces: set[int] = set()
+            for channel in workspace_channels:
+                if channel.workspace_id is None:
+                    continue
+                workspace_id = int(channel.workspace_id)
+                if workspace_id in seen_workspaces:
+                    continue
+                seen_workspaces.add(workspace_id)
+                prepared_files.append(
+                    self._build_auto_migrate_builtin_file(
+                        workspace_id=workspace_id,
+                        batch_size=int(cfg.BUILTIN_MEMORY_SYNC_BATCH_SIZE),
+                        include_relations=bool(cfg.BUILTIN_MEMORY_SYNC_INCLUDE_RELATIONS),
+                    )
+                )
+
+        if import_chat_summary:
+            chat_channels = (
+                await DBChatChannel.filter(is_active=True)
+                .order_by("-update_time")
+                .limit(chat_limit)
+                .all()
+            )
+            seen_chat_keys: set[str] = set()
+            for channel in chat_channels:
+                chat_key = str(channel.chat_key or "").strip()
+                if not chat_key or chat_key in seen_chat_keys:
+                    continue
+                seen_chat_keys.add(chat_key)
+                cursor = await get_chat_import_cursor(plugin.store, chat_key)
+                rows = (
+                    await DBChatMessage.filter(chat_key=chat_key, id__gt=cursor)
+                    .exclude(content_text="")
+                    .order_by("id")
+                    .limit(message_window)
+                    .all()
+                )
+                messages = [
+                    {
+                        "message_id": int(item.id),
+                        "role": "assistant" if str(item.sender_id or "") == "-1" else "user",
+                        "content": str(item.content_text or "").strip(),
+                    }
+                    for item in rows
+                    if str(item.content_text or "").strip()
+                ]
+                if not messages:
+                    continue
+                prepared_files.append(
+                    self._build_auto_migrate_chat_file(
+                        chat_key=chat_key,
+                        messages=messages,
+                        last_message_id=int(messages[-1]["message_id"]),
+                        message_window=message_window,
+                    )
+                )
+
+        if not prepared_files:
+            raise ValueError("没有发现可自动迁移的记忆或聊天记录")
+
         return await self._create_task(
-            task_kind="raw_scan",
-            schema_detected=schema_detected,
+            task_kind="auto_migrate",
+            schema_detected="plain_text",
             files=prepared_files,
             task_payload={
-                "root_path": str(target_path),
-                "input_mode": input_mode,
                 "options": copy.deepcopy(payload),
+                "import_builtin_memory": import_builtin_memory,
+                "import_chat_summary": import_chat_summary,
+                "chat_limit": chat_limit,
+                "message_window": message_window,
             },
         )
 
@@ -1102,6 +1166,94 @@ class ImportBackend:
             "source_name": f"temporal_backfill:{display_name}",
             "local_path": str(file_path.resolve()),
             "detected_strategy_type": "json",
+            "status": "queued",
+            "current_step": "queued",
+            "progress": 0.0,
+            "total_chunks": len(chunks),
+            "done_chunks": 0,
+            "failed_chunks": 0,
+            "cancelled_chunks": 0,
+            "chunks": chunks,
+        }
+        _refresh_file_state(file_state)
+        file_state["status"] = "queued"
+        file_state["current_step"] = "queued"
+        file_state["progress"] = 0.0
+        return file_state
+
+    def _build_auto_migrate_builtin_file(
+        self,
+        *,
+        workspace_id: int,
+        batch_size: int,
+        include_relations: bool,
+    ) -> dict[str, Any]:
+        preview = f"同步工作区 {workspace_id} 的原生记忆增量"
+        chunks = [
+            _build_chunk_state(
+                index=0,
+                chunk_type="builtin_sync",
+                content_preview=preview,
+                plan={
+                    "kind": "builtin_sync",
+                    "workspace_id": int(workspace_id),
+                    "batch_size": max(1, int(batch_size)),
+                    "include_relations": bool(include_relations),
+                },
+            )
+        ]
+        file_state = {
+            "file_id": uuid.uuid4().hex,
+            "name": f"workspace_{int(workspace_id)}",
+            "source_name": f"auto_migrate_builtin:{int(workspace_id)}",
+            "local_path": "",
+            "detected_strategy_type": "auto_migrate",
+            "status": "queued",
+            "current_step": "queued",
+            "progress": 0.0,
+            "total_chunks": len(chunks),
+            "done_chunks": 0,
+            "failed_chunks": 0,
+            "cancelled_chunks": 0,
+            "chunks": chunks,
+        }
+        _refresh_file_state(file_state)
+        file_state["status"] = "queued"
+        file_state["current_step"] = "queued"
+        file_state["progress"] = 0.0
+        return file_state
+
+    def _build_auto_migrate_chat_file(
+        self,
+        *,
+        chat_key: str,
+        messages: list[dict[str, Any]],
+        last_message_id: int,
+        message_window: int,
+    ) -> dict[str, Any]:
+        message_count = len(messages)
+        preview = f"迁移聊天 {chat_key} 的 {message_count} 条增量消息"
+        chunks = [
+            _build_chunk_state(
+                index=0,
+                chunk_type="chat_summary",
+                content_preview=preview,
+                plan={
+                    "kind": "chat_summary",
+                    "chat_key": str(chat_key or "").strip(),
+                    "messages": copy.deepcopy(messages),
+                    "last_message_id": int(last_message_id),
+                    "message_window": max(4, int(message_window)),
+                    "source": f"chat_summary:{str(chat_key or '').strip()}",
+                },
+            )
+        ]
+        file_state = {
+            "file_id": uuid.uuid4().hex,
+            "name": str(chat_key or "").strip(),
+            "source_name": f"auto_migrate_chat:{str(chat_key or '').strip()}",
+            "local_path": "",
+            "detected_strategy_type": "auto_migrate",
             "status": "queued",
             "current_step": "queued",
             "progress": 0.0,
@@ -1344,7 +1496,11 @@ class ImportBackend:
                             chunk["status"] = "completed"
                             chunk["step"] = "completed"
                             chunk["error"] = ""
-                            should_save = should_save or not bool(plan.get("dry_run", False))
+                            saved_flag = result.get("saved")
+                            if saved_flag is None:
+                                should_save = should_save or not bool(plan.get("dry_run", False))
+                            else:
+                                should_save = should_save or bool(saved_flag)
                         except Exception as exc:
                             chunk["status"] = "failed"
                             chunk["step"] = "failed"
@@ -1388,6 +1544,9 @@ class ImportBackend:
         plan: dict[str, Any],
         paragraph_hash_by_chunk_index: dict[int, str],
     ) -> dict[str, Any]:
+        
+        from .plugin import plugin
+
         kind = str(plan.get("kind", "") or "").strip()
         if kind == "paragraph":
             return await import_service.import_paragraph(
@@ -1433,7 +1592,64 @@ class ImportBackend:
             )
             if not updated:
                 raise ValueError("段落时间元数据未发生变化")
-            return {"hash": paragraph_hash, "updated": True}
+            return {"hash": paragraph_hash, "updated": True, "saved": True}
+        if kind == "builtin_sync":
+            result = await sync_builtin_memories(
+                ctx=ctx,
+                plugin_store=plugin.store,
+                workspace_id=int(plan.get("workspace_id", 0) or 0),
+                batch_size=max(1, int(plan.get("batch_size", 64) or 64)),
+                include_relations=bool(plan.get("include_relations", True)),
+                logger=logger,
+            )
+            imported_total = int(result.get("imported_paragraphs", 0) or 0) + int(
+                result.get("imported_relations", 0) or 0
+            )
+            return {
+                "saved": imported_total > 0,
+                "imported_paragraphs": int(result.get("imported_paragraphs", 0) or 0),
+                "imported_relations": int(result.get("imported_relations", 0) or 0),
+            }
+        if kind == "chat_summary":
+            chat_key = str(plan.get("chat_key", "") or "").strip()
+            messages = [
+                {
+                    "role": str(item.get("role", "user") or "user"),
+                    "content": str(item.get("content", "") or "").strip(),
+                    "message_id": int(item.get("message_id", 0) or 0),
+                }
+                for item in list(plan.get("messages") or [])
+                if str(item.get("content", "") or "").strip()
+            ]
+            if len(messages) < AUTO_MIGRATE_MIN_MESSAGES:
+                return {
+                    "saved": False,
+                    "skipped": True,
+                    "reason": "messages_below_threshold",
+                    "message_count": len(messages),
+                }
+            payload_messages = [
+                {"role": str(item["role"]), "content": str(item["content"])}
+                for item in messages
+            ]
+            result = await SummaryService(ctx).import_from_transcript(
+                session_id=chat_key,
+                messages=payload_messages,
+                source=str(plan.get("source", f"chat_summary:{chat_key}") or f"chat_summary:{chat_key}"),
+                context_length=max(AUTO_MIGRATE_MIN_MESSAGES, int(plan.get("message_window", len(payload_messages)) or len(payload_messages))),
+            )
+            if not bool(result.get("success", False)):
+                raise ValueError(str(result.get("message", "聊天总结导入失败") or "聊天总结导入失败"))
+            await set_chat_import_cursor(
+                plugin.store,
+                chat_key,
+                int(plan.get("last_message_id", 0) or 0),
+            )
+            return {
+                "saved": True,
+                "imported_messages": len(payload_messages),
+                "last_message_id": int(plan.get("last_message_id", 0) or 0),
+            }
         raise ValueError(f"未知导入计划类型: {kind}")
 
     async def _cancel_requested(self, ctx: Any, task_id: str) -> bool:
@@ -1456,6 +1672,8 @@ class ImportBackend:
         kind = str(plan.get("kind", "") or "").strip()
         if kind == "backfill":
             return "backfilling"
+        if kind in {"builtin_sync", "chat_summary"}:
+            return "migrating"
         if kind == "relation":
             return "extracting"
         return "writing"

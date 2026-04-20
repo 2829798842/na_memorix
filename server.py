@@ -152,14 +152,13 @@ class ImportPasteTaskRequest(ImportCommonTaskRequest):
     name: str = ""
 
 
-class ImportRawScanTaskRequest(ImportCommonTaskRequest):
-    """本地扫描任务请求。"""
+class ImportAutoMigrateTaskRequest(ImportCommonTaskRequest):
+    """自动迁移记忆任务请求。"""
 
-    alias: str
-    relative_path: str = ""
-    glob: str = "*"
-    recursive: bool = True
-    input_mode: str = "text"
+    import_builtin_memory: bool = True
+    import_chat_summary: bool = True
+    chat_limit: int = Field(default=20, ge=1, le=200)
+    message_window: int = Field(default=50, ge=4, le=200)
 
 
 class ImportTemporalBackfillTaskRequest(BaseModel):
@@ -1665,15 +1664,15 @@ class MemorixServer:
                 logger.error("Create import paste task failed: %s", exc, exc_info=True)
                 raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-        @self.app.post("/api/import/tasks/raw_scan")
-        async def create_import_raw_scan_task(data: ImportRawScanTaskRequest):
-            _ensure_web_write_allowed("创建本地扫描任务")
+        @self.app.post("/api/import/tasks/auto_migrate")
+        async def create_import_auto_migrate_task(data: ImportAutoMigrateTaskRequest):
+            _ensure_web_write_allowed("创建自动迁移记忆任务")
             try:
-                return await self._import_backend.create_raw_scan_task(data.model_dump())
+                return await self._import_backend.create_auto_migrate_task(data.model_dump())
             except ValueError as exc:
                 _raise_import_backend_error(exc)
             except Exception as exc:
-                logger.error("Create import raw scan task failed: %s", exc, exc_info=True)
+                logger.error("Create import auto migrate task failed: %s", exc, exc_info=True)
                 raise HTTPException(status_code=500, detail=str(exc)) from exc
 
         @self.app.post("/api/import/tasks/temporal_backfill")
