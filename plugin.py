@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator, Literal, Optional
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import Field
 
 from nekro_agent.api import i18n
@@ -25,13 +25,15 @@ from nekro_agent.schemas.agent_ctx import AgentCtx
 from amemorix.services import ImportService, QueryService, SummaryService
 from amemorix.settings import AppSettings, DEFAULT_CONFIG, _deep_merge
 
+from .core.utils.runtime_dependencies import get_runtime_dependency_report
+
 sys.modules.setdefault("server", importlib.import_module(f"{__package__}.server"))
 
 plugin = NekroPlugin(
     name="na_memorix",
     module_name="na_memorix",
     description="A_Memorix-style memory graph plugin",
-    version="0.1.0",
+    version="0.2.0",
     author="litroenade",
     url="",
     i18n_name=i18n.i18n_text(
@@ -481,6 +483,7 @@ _runtime_tuning_overlay_lock = threading.RLock()
 _runtime_tuning_overlay: dict[str, Any] = {}
 _runtime_tuning_overlay_history: list[dict[str, Any]] = []
 _RUNTIME_SYNC_INTERVAL_SECONDS = 2.0
+_RUNTIME_FREE_COMPAT_PATHS = frozenset({"/api/config", "/api/ui_capabilities"})
 
 
 def _parse_chat_filter_chats(raw_value: Any) -> list[str]:
@@ -903,23 +906,41 @@ def _extract_compat_api_path(path: str) -> Optional[str]:
     return None
 
 
+def _build_runtime_boot_error_detail(exc: Exception) -> str:
+    """将 runtime 初始化异常转换为面向 Web 的可读错误。"""
+
+    dependency_report = get_runtime_dependency_report()
+    if not dependency_report.get("ready", True):
+        detail = str(dependency_report.get("detail") or "").strip()
+        if detail:
+            return detail
+    text = str(exc).strip()
+    return text or "na_memorix 运行时初始化失败"
+
+
 async def _compat_runtime_dependency(request: Request) -> AsyncIterator[None]:
     """为兼容层 `/api/*` 路由施加请求级 runtime 绑定。"""
 
     compat_path = _extract_compat_api_path(str(request.url.path or ""))
-    if compat_path is None or compat_path == "/api/config":
+    if compat_path is None or compat_path in _RUNTIME_FREE_COMPAT_PATHS:
         yield
         return
 
-    async with runtime_scope():
-        yield
+    try:
+        async with runtime_scope():
+            yield
+    except (ImportError, RuntimeError) as exc:
+        raise HTTPException(status_code=503, detail=_build_runtime_boot_error_detail(exc)) from exc
 
 
 async def _v1_runtime_dependency() -> AsyncIterator[None]:
     """为 `/v1/*` 路由施加请求级 runtime 绑定。"""
 
-    async with runtime_scope():
-        yield
+    try:
+        async with runtime_scope():
+            yield
+    except (ImportError, RuntimeError) as exc:
+        raise HTTPException(status_code=503, detail=_build_runtime_boot_error_detail(exc)) from exc
 
 
 async def _runtime_sync_loop() -> None:

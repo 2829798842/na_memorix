@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 from amemorix.common.logging import get_logger
 from amemorix.settings import mask_sensitive
 
+from .core.utils.runtime_dependencies import get_runtime_dependency_report
 from .import_backend import ImportBackend, resolve_local_plugin_data_dir
 from .retrieval_tuning_backend import RetrievalTuningBackend
 
@@ -417,11 +418,21 @@ class MemorixServer:
 
         @self.app.middleware("http")
         async def _runtime_middleware(request, call_next):
-            from .plugin import _extract_compat_api_path
+            from .plugin import (
+                _RUNTIME_FREE_COMPAT_PATHS,
+                _build_runtime_boot_error_detail,
+                _extract_compat_api_path,
+            )
 
             compat_path = _extract_compat_api_path(str(request.url.path or ""))
-            if compat_path is not None and compat_path not in {"/api/config"}:
-                await _ensure_runtime()
+            if compat_path is not None and compat_path not in _RUNTIME_FREE_COMPAT_PATHS:
+                try:
+                    await _ensure_runtime()
+                except (ImportError, RuntimeError) as exc:
+                    raise HTTPException(
+                        status_code=503,
+                        detail=_build_runtime_boot_error_detail(exc),
+                    ) from exc
             return await call_next(request)
 
         @self.app.get("/healthz")
@@ -1883,6 +1894,24 @@ class MemorixServer:
         @self.app.get("/api/ui_capabilities")
         async def get_ui_capabilities():
             """返回当前 Web 面板的能力接入情况。"""
+            dependency_report = get_runtime_dependency_report()
+            runtime_ready = bool(dependency_report.get("ready", False))
+            runtime_detail = str(dependency_report.get("detail") or "").strip()
+            if runtime_ready:
+                messages = {
+                    "runtime": "na_memorix 运行时已就绪。",
+                    "compat_graph_ui": "图谱运行时已接入，可直接加载主面板。",
+                    "import_backend": "宿主导入后端已接入，可直接在当前页面执行上传、扫描、粘贴导入、时序回填与任务查看。",
+                    "retrieval_tuning_backend": "宿主检索调优后端已接入，可直接在当前页面执行参数应用、自动调优与报告查看。",
+                }
+            else:
+                runtime_message = runtime_detail or "na_memorix 运行时依赖尚未就绪。"
+                messages = {
+                    "runtime": runtime_message,
+                    "compat_graph_ui": f"{runtime_message} 主面板已切换为等待依赖恢复状态。",
+                    "import_backend": f"{runtime_message} 导入中心已自动切换为兼容说明模式。",
+                    "retrieval_tuning_backend": f"{runtime_message} 检索调优页已自动切换为兼容说明模式。",
+                }
             return {
                 "pages": {
                     "index": True,
@@ -1890,15 +1919,15 @@ class MemorixServer:
                     "tuning": True,
                 },
                 "features": {
-                    "compat_graph_ui": True,
-                    "import_backend": True,
-                    "retrieval_tuning_backend": True,
+                    "compat_graph_ui": runtime_ready,
+                    "import_backend": runtime_ready,
+                    "retrieval_tuning_backend": runtime_ready,
                 },
-                "messages": {
-                    "import_backend": "宿主导入后端已接入，可直接在当前页面执行上传、扫描、粘贴导入、时序回填与任务查看。",
-                    "retrieval_tuning_backend": "宿主检索调优后端已接入，可直接在当前页面执行参数应用、自动调优与报告查看。",
-                },
+                "messages": messages,
                 "web_read_only": bool(self.plugin.get_config("web.read_only", False)),
+                "runtime_ready": runtime_ready,
+                "dependencies": dependency_report.get("items", []),
+                "missing_dependencies": dependency_report.get("missing", []),
             }
 
         @self.app.post("/api/config/auto_save")

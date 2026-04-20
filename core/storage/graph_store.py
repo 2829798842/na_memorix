@@ -13,6 +13,10 @@ import threading
 import asyncio
 
 import numpy as np
+from ..utils.runtime_dependencies import ensure_scipy
+
+_SCIPY_STATUS = ensure_scipy()
+_SCIPY_ERROR_DETAIL = _SCIPY_STATUS.detail
 
 class SparseMatrixFormat(Enum):
     """稀疏矩阵格式"""
@@ -23,8 +27,10 @@ try:
     from scipy.sparse import csr_matrix, csc_matrix, triu, save_npz, load_npz, bmat, lil_matrix
     from scipy.sparse.linalg import norm
     HAS_SCIPY = True
-except ImportError:
+except ImportError as exc:
     HAS_SCIPY = False
+    if _SCIPY_STATUS.available:
+        _SCIPY_ERROR_DETAIL = f"SciPy 已安装但导入失败：{exc}"
 
 import contextlib
 from amemorix.common.logging import get_logger
@@ -70,7 +76,7 @@ class GraphStore:
             data_dir: 数据目录
         """
         if not HAS_SCIPY:
-            raise ImportError("SciPy 未安装，请安装: pip install scipy")
+            raise ImportError(_SCIPY_ERROR_DETAIL or "SciPy 未安装，请安装后重试")
 
         if isinstance(matrix_format, SparseMatrixFormat):
             self.matrix_format = matrix_format.value

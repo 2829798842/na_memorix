@@ -1382,6 +1382,7 @@
       let isSimulationRunning = true; // Physics simulation state
       let _freezeTimer = null;
       let pluginConfigSnapshot = null;
+      let runtimeCapabilitySnapshot = null;
       let activeReindexTaskId = null;
       let reindexPollTimer = null;
 
@@ -1391,6 +1392,16 @@
         }
         return config;
       });
+
+      function extractRequestErrorMessage(err, fallback = "请求失败") {
+        return (
+          err?.response?.data?.detail ||
+          err?.response?.data?.message ||
+          err?.response?.data?.error ||
+          err?.message ||
+          fallback
+        );
+      }
 
       // 加载控制 (Loading Control)
       function showLoader(text = "正在同步全景知识图谱...", isSync = false) {
@@ -1559,11 +1570,40 @@
         }
       }
 
+      async function loadUiCapabilities() {
+        try {
+          const res = await axios.get("/api/ui_capabilities");
+          runtimeCapabilitySnapshot = res.data || {};
+          if (runtimeCapabilitySnapshot.runtime_ready === false) {
+            const runtimeMessage =
+              runtimeCapabilitySnapshot.messages?.runtime ||
+              runtimeCapabilitySnapshot.messages?.compat_graph_ui ||
+              "na_memorix 运行时暂未就绪";
+            const meta = document.getElementById("plugin-status-meta");
+            if (meta) meta.textContent = runtimeMessage;
+            showToast(runtimeMessage, 6500);
+            return false;
+          }
+        } catch (err) {
+          const message = `能力探测失败: ${extractRequestErrorMessage(err, "能力探测失败")}`;
+          const meta = document.getElementById("plugin-status-meta");
+          if (meta) meta.textContent = message;
+          showToast(message, 6500);
+          return false;
+        }
+        return true;
+      }
+
       // Init
-      document.addEventListener("DOMContentLoaded", () => {
+      document.addEventListener("DOMContentLoaded", async () => {
         initNetwork();
-        loadData();
-        loadConfig();
+        const canLoadGraph = await loadUiCapabilities();
+        await loadConfig();
+        if (canLoadGraph) {
+          loadData();
+        } else {
+          hideLoader();
+        }
       });
 
       function initNetwork() {
@@ -1869,7 +1909,7 @@
             }, 200);
           }
         } catch (err) {
-          showToast("连接失败: " + err.message);
+          showToast(`连接失败: ${extractRequestErrorMessage(err, "图谱加载失败")}`, 6500);
           hideLoader();
         }
       }
@@ -1907,6 +1947,15 @@
             ? "Inject: ON"
             : "Inject: OFF"
           : "Inject: Disabled";
+
+        const runtimeBlocked = runtimeCapabilitySnapshot?.runtime_ready === false;
+        const runtimeMessage = runtimeCapabilitySnapshot?.messages?.runtime || "";
+        if (runtimeBlocked) {
+          memoryPill.dataset.state = "warn";
+          injectPill.dataset.state = "warn";
+          meta.textContent = runtimeMessage || "na_memorix 运行时暂未就绪";
+          return;
+        }
 
         meta.textContent = `Model: ${modelGroup} | Top-K: ${topK}${readOnly ? " | Read only" : ""}`;
       }

@@ -8,8 +8,8 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
-__version__ = "0.7.0"
-__author__ = "KroMiose"
+__version__ = "0.2.0"
+__author__ = "litroenade"
 _PACKAGE_DIR = Path(__file__).resolve().parent
 
 

@@ -9,7 +9,7 @@
 - 维护记忆图谱，支持边权调整、冻结、恢复、强化、保护等操作。
 - 为 Agent 自动注入记忆上下文。
 - 提供人物画像查询、覆盖和注册表管理。
-- 提供 Web 可视化界面，用于浏览图谱、查看来源、管理记忆和触发重建索引。11
+- 提供 Web 可视化界面，用于浏览图谱、查看来源、管理记忆和触发重建索引。
 - 暴露兼容的 `/api/*` 与 `/v1/*` 接口，便于前端和旧调用链继续工作。
 
 ## Web 界面入口
@@ -17,7 +17,7 @@
 - [打开主面板](/plugins/litroenade.na_memorix/)
 - [打开导入中心](/plugins/litroenade.na_memorix/import)
 - [打开检索调优](/plugins/litroenade.na_memorix/tuning)
-- [项目仓库](https://github.com/2829798842/na_memorix)
+- [项目仓库](https://github.com/litroenade/na_memorix)
 
 ### 存储后端
  
@@ -40,6 +40,13 @@
   - `[embedding.openai]`
   - `OPENAPI_*`
   - `OPENAI_*`
+
+### 动态依赖与运行前置条件
+
+- 图存储依赖 `SciPy`。
+- 插件已接入 Nekro 的 `dynamic_import_pkg(...)` 动态依赖导入机制；当宿主环境缺少 `scipy` 时，会在首次需要图运行时时尝试自动安装。
+- 如果宿主无法访问配置的 PyPI 镜像，或动态安装失败，`/api/ui_capabilities` 与主面板会直接提示依赖缺失原因，导入中心和检索调优页会自动退化到兼容说明模式。
+- 若需要手动预装，请确保宿主 Python 环境可导入 `scipy`，并允许插件进程写入 Nekro 的动态包目录。
 
 ### 插件数据目录
 
