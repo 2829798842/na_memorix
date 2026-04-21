@@ -8,6 +8,7 @@
 - 执行语义检索、时间检索、实体检索和关系检索。
 - 维护记忆图谱，支持边权调整、冻结、恢复、强化、保护等操作。
 - 为 Agent 自动注入记忆上下文。
+- 按每日固定时间批量总结活跃频道新增聊天记录，并写入长期记忆。
 - 提供人物画像查询、覆盖和注册表管理。
 - 提供 Web 可视化界面，用于浏览图谱、查看来源、管理记忆和触发重建索引。
 - 暴露兼容的 `/api/*` 与 `/v1/*` 接口，便于前端和旧调用链继续工作。
@@ -85,6 +86,14 @@ data/plugin_data/{plugin.key}/runtime/
   - Embedding 维度。
 - `SUMMARIZATION_MODEL_GROUP`
   - 聊天总结模型组名。
+- `SUMMARIZATION_CONTEXT_LENGTH`
+  - 手动总结和定时总结每次读取的聊天消息窗口大小。
+- `SCHEDULED_SUMMARY_ENABLED`
+  - 是否启用定时批量总结。该功能会调用总结模型并消耗 token，默认关闭。
+- `SCHEDULED_SUMMARY_TIMES`
+  - 每日触发时间列表，每行一个 `HH:MM`，例如 `04:00`。
+- `SCHEDULED_SUMMARY_CHAT_LIMIT`
+  - 每次定时总结最多处理多少个有新增文本消息的活跃频道。
 - `PERSON_PROFILE_ENABLED`
   - 是否启用人物画像。
 - `WEB_READ_ONLY`

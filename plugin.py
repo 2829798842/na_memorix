@@ -2,6 +2,7 @@
 
 import asyncio
 import copy
+import datetime
 import hashlib
 import importlib
 import json
@@ -27,7 +28,12 @@ from amemorix.common.logging import bind_plugin_logger
 from amemorix.services import ImportService, QueryService, SummaryService
 from amemorix.settings import AppSettings, DEFAULT_CONFIG, _deep_merge
 
-from .builtin_memory_sync import filter_results_for_scope, sync_builtin_memories
+from .builtin_memory_sync import (
+    filter_results_for_scope,
+    get_chat_import_cursor,
+    set_chat_import_cursor,
+    sync_builtin_memories,
+)
 from .core.utils.runtime_dependencies import get_runtime_dependency_report
 
 sys.modules.setdefault("server", importlib.import_module(f"{__package__}.server"))
@@ -323,6 +329,39 @@ class NaMemorixConfig(ConfigBase):
         ge=4,
         le=200,
     )
+    SCHEDULED_SUMMARY_ENABLED: bool = _config_field(
+        False,
+        category_zh="定时总结",
+        category_en="Scheduled Summary",
+        title_zh="启用定时批量总结",
+        title_en="Enable Scheduled Summary",
+        description_zh="按每日固定时间自动检查活跃频道，把新增聊天记录总结写入 na_memorix。会调用总结模型，可能消耗 token，默认关闭。",
+        description_en="Checks active chats at configured daily times and summarizes new messages into na_memorix. This calls the summarization model and may consume tokens, so it is disabled by default.",
+    )
+    SCHEDULED_SUMMARY_TIMES: str = _config_field(
+        "04:00",
+        category_zh="定时总结",
+        category_en="Scheduled Summary",
+        title_zh="定时总结时间",
+        title_en="Scheduled Summary Times",
+        description_zh="每日触发时间，每行一个 HH:MM，例如 04:00。插件每分钟检查一次是否跨过目标时间。",
+        description_en="Daily trigger times, one HH:MM value per line, for example 04:00. The plugin checks once per minute whether a target time was crossed.",
+        extra_kwargs={
+            "is_textarea": True,
+            "placeholder": "04:00\n23:30",
+        },
+    )
+    SCHEDULED_SUMMARY_CHAT_LIMIT: int = _config_field(
+        20,
+        category_zh="定时总结",
+        category_en="Scheduled Summary",
+        title_zh="单次频道上限",
+        title_en="Chat Limit Per Run",
+        description_zh="每次定时批量总结最多处理多少个有新增文本消息的活跃频道，用于控制 token 和运行时长。",
+        description_en="Maximum number of active chats with new text messages processed in one scheduled run, limiting token cost and runtime.",
+        ge=1,
+        le=200,
+    )
     PERSON_PROFILE_ENABLED: bool = _config_field(
         True,
         category_zh="人物画像",
@@ -504,6 +543,7 @@ LIVE_PATHS: tuple[str, ...] = (
     "person_profile",
     "filter",
     "routing",
+    "schedule",
     "web",
 )
 
@@ -512,6 +552,7 @@ _runtime_handle: Optional[RuntimeHandle] = None
 _runtime_lock = asyncio.Lock()
 _bound_runtime_context: ContextVar[Optional[Any]] = ContextVar("na_memorix_bound_runtime_context", default=None)
 _runtime_sync_task: Optional[asyncio.Task[Any]] = None
+_scheduled_summary_task: Optional[asyncio.Task[Any]] = None
 _runtime_tuning_overlay_lock = threading.RLock()
 _runtime_tuning_overlay: dict[str, Any] = {}
 _runtime_tuning_overlay_history: list[dict[str, Any]] = []
@@ -532,6 +573,46 @@ def _parse_chat_filter_chats(raw_value: Any) -> list[str]:
         if item:
             items.append(item)
     return items
+
+
+def _parse_schedule_times_config(raw_value: Any) -> list[str]:
+    """解析每日定时总结时间，保留合法 HH:MM 项。"""
+
+    text = str(raw_value or "")
+    times: list[str] = []
+    seen: set[str] = set()
+    for line in text.replace(",", "\n").splitlines():
+        item = line.strip()
+        if not item:
+            continue
+        try:
+            hour_text, minute_text = item.split(":", 1)
+            hour = int(hour_text)
+            minute = int(minute_text)
+        except (TypeError, ValueError):
+            plugin.logger.warning("忽略非法 na_memorix 定时总结时间: %s", item)
+            continue
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            plugin.logger.warning("忽略越界 na_memorix 定时总结时间: %s", item)
+            continue
+        normalized = f"{hour:02d}:{minute:02d}"
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        times.append(normalized)
+    return times or ["04:00"]
+
+
+def _parse_schedule_time_item(value: str) -> tuple[int, int] | None:
+    try:
+        hour_text, minute_text = str(value or "").strip().split(":", 1)
+        hour = int(hour_text)
+        minute = int(minute_text)
+    except (TypeError, ValueError):
+        return None
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    return hour, minute
 
 
 def _get_nested(config: dict[str, Any], path: str, default: Any = None) -> Any:
@@ -626,6 +707,11 @@ def _build_settings_dict(config_obj: NaMemorixConfig) -> dict[str, Any]:
             "context_length": int(config_obj.SUMMARIZATION_CONTEXT_LENGTH),
             "model_name": str(config_obj.SUMMARIZATION_MODEL_GROUP or "default"),
             "model_group": str(config_obj.SUMMARIZATION_MODEL_GROUP or "default"),
+        },
+        "schedule": {
+            "enabled": bool(config_obj.SCHEDULED_SUMMARY_ENABLED),
+            "import_times": _parse_schedule_times_config(config_obj.SCHEDULED_SUMMARY_TIMES),
+            "chat_limit": int(config_obj.SCHEDULED_SUMMARY_CHAT_LIMIT),
         },
         "person_profile": {
             "enabled": bool(config_obj.PERSON_PROFILE_ENABLED),
@@ -1128,6 +1214,137 @@ async def _build_recent_query_text(_ctx: AgentCtx, limit: int = 6) -> str:
     return "\n".join(items[-limit:])
 
 
+def _scheduled_summary_time_crossed(
+    *,
+    last_check: datetime.datetime,
+    now: datetime.datetime,
+    time_text: str,
+) -> bool:
+    parsed = _parse_schedule_time_item(time_text)
+    if parsed is None:
+        return False
+    hour, minute = parsed
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    return last_check < target <= now
+
+
+def _channel_filter_ids(channel: DBChatChannel) -> tuple[str | None, str | None]:
+    channel_type = str(channel.channel_type or "").strip().lower()
+    channel_id = str(channel.channel_id or "").strip()
+    group_id = channel_id if channel_type == "group" else None
+    user_id = channel_id if channel_type in {"private", "c2c"} else None
+    return group_id, user_id
+
+
+async def _run_scheduled_summary_once(trigger_time: str) -> dict[str, int]:
+    """按活跃频道批量导入新增聊天总结。"""
+
+    cfg = plugin.get_config(NaMemorixConfig)
+    if not bool(cfg.GLOBAL_MEMORY_ENABLED) or not bool(cfg.SCHEDULED_SUMMARY_ENABLED):
+        return {"success": 0, "failed": 0, "skipped": 0}
+
+    context_length = max(4, min(200, int(cfg.SUMMARIZATION_CONTEXT_LENGTH)))
+    chat_limit = max(1, min(200, int(cfg.SCHEDULED_SUMMARY_CHAT_LIMIT)))
+    success_count = 0
+    failed_count = 0
+    skipped_count = 0
+    seen_chat_keys: set[str] = set()
+
+    async with runtime_scope() as ctx:
+        service = SummaryService(ctx)
+        channels = await DBChatChannel.filter(is_active=True).order_by("-update_time", "id").all()
+        for channel in channels:
+            if success_count >= chat_limit:
+                break
+
+            chat_key = str(channel.chat_key or "").strip()
+            if not chat_key or chat_key in seen_chat_keys:
+                continue
+            seen_chat_keys.add(chat_key)
+
+            group_id, user_id = _channel_filter_ids(channel)
+            if not ctx.is_chat_enabled(stream_id=chat_key, group_id=group_id, user_id=user_id):
+                skipped_count += 1
+                continue
+
+            cursor = await get_chat_import_cursor(plugin.store, chat_key)
+            rows = (
+                await DBChatMessage.filter(chat_key=chat_key, id__gt=cursor)
+                .exclude(content_text="")
+                .order_by("id")
+                .limit(context_length)
+                .all()
+            )
+            messages = [
+                {
+                    "message_id": int(msg.id),
+                    "role": "assistant" if str(msg.sender_id or "") == "-1" else "user",
+                    "content": str(msg.content_text or "").strip(),
+                }
+                for msg in rows
+                if str(msg.content_text or "").strip()
+            ]
+            if len(messages) < 4:
+                skipped_count += 1
+                continue
+
+            last_message_id = int(messages[-1]["message_id"])
+            try:
+                result = await service.import_from_transcript(
+                    session_id=chat_key,
+                    messages=messages,
+                    source=f"chat_summary:{chat_key}",
+                    context_length=context_length,
+                )
+                if bool(result.get("success")):
+                    await set_chat_import_cursor(plugin.store, chat_key, last_message_id)
+                    success_count += 1
+                else:
+                    failed_count += 1
+                    plugin.logger.warning(
+                        "na_memorix scheduled summary failed: chat_key=%s message=%s",
+                        chat_key,
+                        result.get("message"),
+                    )
+            except Exception:
+                failed_count += 1
+                plugin.logger.exception("na_memorix scheduled summary crashed: chat_key=%s", chat_key)
+
+    plugin.logger.info(
+        "na_memorix scheduled summary finished: trigger=%s success=%s failed=%s skipped=%s",
+        trigger_time,
+        success_count,
+        failed_count,
+        skipped_count,
+    )
+    return {"success": success_count, "failed": failed_count, "skipped": skipped_count}
+
+
+async def _scheduled_summary_loop() -> None:
+    """原版 A_Memorix 风格的每日定时批量总结循环。"""
+
+    last_check = datetime.datetime.now()
+    while True:
+        try:
+            await asyncio.sleep(60)
+            cfg = plugin.get_config(NaMemorixConfig)
+            if not bool(cfg.GLOBAL_MEMORY_ENABLED) or not bool(cfg.SCHEDULED_SUMMARY_ENABLED):
+                last_check = datetime.datetime.now()
+                continue
+
+            now = datetime.datetime.now()
+            for time_text in _parse_schedule_times_config(cfg.SCHEDULED_SUMMARY_TIMES):
+                if _scheduled_summary_time_crossed(last_check=last_check, now=now, time_text=time_text):
+                    plugin.logger.info("na_memorix scheduled summary triggered: %s", time_text)
+                    await _run_scheduled_summary_once(time_text)
+            last_check = now
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            plugin.logger.exception("na_memorix scheduled summary loop failed")
+            last_check = datetime.datetime.now()
+
+
 async def _get_workspace_id_for_ctx(_ctx: AgentCtx) -> int | None:
     chat_key = str(_ctx.from_chat_key or "").strip()
     if not chat_key:
@@ -1299,16 +1516,21 @@ async def memorix_reindex(_ctx: AgentCtx, batch_size: int = 32):
 async def _init_plugin():
     """保持插件初始化轻量且惰性。"""
 
-    global _runtime_sync_task
+    global _runtime_sync_task, _scheduled_summary_task
 
     if _runtime_sync_task is None or _runtime_sync_task.done():
         _runtime_sync_task = asyncio.create_task(_runtime_sync_loop(), name="na-memorix-runtime-sync")
+    if _scheduled_summary_task is None or _scheduled_summary_task.done():
+        _scheduled_summary_task = asyncio.create_task(
+            _scheduled_summary_loop(),
+            name="na-memorix-scheduled-summary",
+        )
     return None
 
 
 @plugin.mount_cleanup_method()
 async def _cleanup_plugin():
-    global _runtime_handle, _runtime_sync_task
+    global _runtime_handle, _runtime_sync_task, _scheduled_summary_task
 
     if _runtime_sync_task is not None:
         _runtime_sync_task.cancel()
@@ -1318,6 +1540,15 @@ async def _cleanup_plugin():
             pass
         finally:
             _runtime_sync_task = None
+
+    if _scheduled_summary_task is not None:
+        _scheduled_summary_task.cancel()
+        try:
+            await _scheduled_summary_task
+        except asyncio.CancelledError:
+            pass
+        finally:
+            _scheduled_summary_task = None
 
     async with _runtime_lock:
         handle = _runtime_handle
