@@ -312,6 +312,35 @@
       .list-item:hover {
         background: #1e293b;
       }
+      .channel-list {
+        max-height: 220px;
+        overflow: auto;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 6px;
+        background: #0f172a;
+      }
+      .channel-item {
+        display: grid;
+        grid-template-columns: auto 1fr auto;
+        gap: 8px;
+        align-items: start;
+        padding: 7px;
+        border-radius: 8px;
+      }
+      .channel-item:hover {
+        background: #1e293b;
+      }
+      .channel-title {
+        color: #f8fafc;
+        font-weight: 700;
+      }
+      .channel-meta {
+        margin-top: 2px;
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.45;
+      }
       .task-list {
         max-height: 260px;
         overflow: auto;
@@ -741,6 +770,28 @@
                     />
                   </div>
                 </div>
+                <div class="row">
+                  <div>
+                    <label>频道选择模式</label>
+                    <select id="auto-chat-mode">
+                      <option value="active_only">仅活跃频道</option>
+                      <option value="all">全部频道</option>
+                      <option value="selected">指定频道</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label>候选频道</label>
+                    <button class="btn" id="auto-channel-refresh" type="button">
+                      刷新频道列表
+                    </button>
+                    <div class="tiny" id="auto-channel-meta">未加载频道列表</div>
+                  </div>
+                </div>
+                <div
+                  class="channel-list"
+                  id="auto-channel-list"
+                  style="display: none"
+                ></div>
                 <div class="tiny" style="margin-top: 8px">
                   原生记忆迁移基本不消耗 token；聊天总结会调用总结模型，首次迁移或积压较多时可能耗费大量 token。
                 </div>
@@ -930,6 +981,8 @@
         pollErrSig: "",
         pollErrAt: 0,
         capabilities: null,
+        autoChannels: [],
+        selectedChatKeys: new Set(),
       };
       const IMPORT_COMPAT_GUIDE = `# 导入中心兼容页
 
@@ -1035,7 +1088,6 @@ Content-Type: application/json
       const TASK_KIND_ZH = {
         upload: "上传文件",
         paste: "粘贴导入",
-        raw_scan: "本地扫描",
         auto_migrate: "自动迁移记忆",
         temporal_backfill: "时序回填",
         maibot_migration: "MaiBot 迁移",
@@ -1048,7 +1100,6 @@ Content-Type: application/json
       const SOURCE_ZH = {
         upload: "上传文件",
         paste: "粘贴导入",
-        raw_scan: "本地扫描",
         auto_migrate: "自动迁移记忆",
         temporal_backfill: "时序回填",
         maibot_migration: "MaiBot 迁移",
@@ -1199,6 +1250,8 @@ Content-Type: application/json
         const disabledIds = [
           "upload-submit",
           "paste-submit",
+          "auto-submit",
+          "auto-channel-refresh",
           "backfill-submit",
           "refresh-btn",
           "cancel-btn",
@@ -1345,6 +1398,69 @@ Content-Type: application/json
               )
               .join("")
           : `<div class="tiny">暂无文件</div>`;
+      }
+
+      function autoChatMode() {
+        return $("auto-chat-mode")?.value || "active_only";
+      }
+
+      function renderAutoChannels() {
+        const listEl = $("auto-channel-list");
+        const metaEl = $("auto-channel-meta");
+        if (!listEl || !metaEl) return;
+        const mode = autoChatMode();
+        const selectedMode = mode === "selected";
+        const channels = Array.isArray(state.autoChannels)
+          ? state.autoChannels
+          : [];
+        const activeCount = channels.filter((item) => !!item.is_active).length;
+        const selectedCount = state.selectedChatKeys.size;
+        listEl.style.display = selectedMode ? "" : "none";
+        metaEl.textContent = `已加载 ${channels.length} 个频道，活跃 ${activeCount} 个，已选 ${selectedCount} 个`;
+        if (!selectedMode) return;
+        if (!channels.length) {
+          listEl.innerHTML = `<div class="tiny">暂无频道，请刷新列表</div>`;
+          return;
+        }
+        listEl.innerHTML = channels
+          .map((item, index) => {
+            const chatKey = String(item.chat_key || "");
+            const title = item.channel_name || chatKey || "(未命名频道)";
+            const status = item.is_active ? "活跃" : "非活跃";
+            const pending = Number(item.pending_text_messages || 0);
+            const checked = state.selectedChatKeys.has(chatKey)
+              ? "checked"
+              : "";
+            return `
+              <label class="channel-item">
+                <input type="checkbox" data-channel-idx="${index}" ${checked} />
+                <span>
+                  <div class="channel-title">${esc(title)}</div>
+                  <div class="channel-meta">
+                    ${esc(status)} | chat_key=${esc(chatKey)} | adapter=${esc(item.adapter_key || "-")} | workspace=${esc(item.workspace_id ?? "-")}
+                    <br />
+                    cursor=${esc(item.last_imported_message_id ?? 0)} | 待迁移文本消息=${esc(pending)}
+                  </div>
+                </span>
+                <span class="tiny">${esc(item.update_time || "")}</span>
+              </label>
+            `;
+          })
+          .join("");
+      }
+
+      async function loadAutoChannels() {
+        const d = await req("/api/import/auto_migrate/channels?mode=all&limit=1000", {
+          headers: headers(false),
+        });
+        state.autoChannels = Array.isArray(d.channels) ? d.channels : [];
+        const known = new Set(
+          state.autoChannels.map((item) => String(item.chat_key || "")),
+        );
+        state.selectedChatKeys = new Set(
+          Array.from(state.selectedChatKeys).filter((key) => known.has(key)),
+        );
+        renderAutoChannels();
       }
 
       function populateAliasSelects() {
@@ -1578,8 +1694,19 @@ Content-Type: application/json
       async function createAutoMigrateTask() {
         const importBuiltin = !!$("auto-import-builtin").checked;
         const importChat = !!$("auto-import-chat").checked;
+        const chatMode = autoChatMode();
+        const selectedChatKeys = Array.from(state.selectedChatKeys);
+        const chatLimit = Math.max(1, Number($("auto-chat-limit").value || 20));
         if (!importBuiltin && !importChat) {
           toast("请至少启用一种自动迁移来源");
+          return;
+        }
+        if (importChat && chatMode === "selected" && !selectedChatKeys.length) {
+          toast("指定频道模式下请至少选择一个频道");
+          return;
+        }
+        if (importChat && chatMode === "selected" && selectedChatKeys.length > chatLimit) {
+          toast("已选频道数超过频道处理上限，请提高上限或减少选择");
           return;
         }
         if (
@@ -1593,7 +1720,9 @@ Content-Type: application/json
           ...commonParams(),
           import_builtin_memory: importBuiltin,
           import_chat_summary: importChat,
-          chat_limit: Math.max(1, Number($("auto-chat-limit").value || 20)),
+          chat_mode: chatMode,
+          selected_chat_keys: selectedChatKeys,
+          chat_limit: chatLimit,
           message_window: Math.max(
             4,
             Number($("auto-message-window").value || 50),
@@ -1771,6 +1900,25 @@ Content-Type: application/json
             toast(`自动迁移失败: ${e.message}`);
           }
         };
+        $("auto-chat-mode").onchange = () => renderAutoChannels();
+        $("auto-channel-refresh").onclick = async () => {
+          try {
+            await loadAutoChannels();
+            toast("频道列表已刷新");
+          } catch (e) {
+            toast(`频道列表加载失败: ${e.message}`);
+          }
+        };
+        $("auto-channel-list").onchange = (e) => {
+          const idx = e.target?.dataset?.channelIdx;
+          if (idx === undefined) return;
+          const item = state.autoChannels[Number(idx)];
+          const chatKey = String(item?.chat_key || "");
+          if (!chatKey) return;
+          if (e.target.checked) state.selectedChatKeys.add(chatKey);
+          else state.selectedChatKeys.delete(chatKey);
+          renderAutoChannels();
+        };
         $("backfill-submit").onclick = async () => {
           try {
             await createTemporalBackfillTask();
@@ -1853,6 +2001,11 @@ Content-Type: application/json
         renderUploadFiles();
         await loadUiCapabilities();
         if (hasImportBackend()) {
+          try {
+            await loadAutoChannels();
+          } catch (e) {
+            $("auto-channel-meta").textContent = `频道列表加载失败: ${e.message}`;
+          }
           await poll();
           restartPoll();
         }

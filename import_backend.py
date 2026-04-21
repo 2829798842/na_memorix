@@ -33,6 +33,7 @@ DEFAULT_CHUNK_CONCURRENCY = 4
 AUTO_MIGRATE_MIN_MESSAGES = 4
 AUTO_MIGRATE_DEFAULT_CHAT_LIMIT = 20
 AUTO_MIGRATE_DEFAULT_MESSAGE_WINDOW = 50
+AUTO_MIGRATE_CHAT_MODES = {"all", "active_only", "selected"}
 SUPPORTED_TEXT_SUFFIXES = {".txt", ".md"}
 SUPPORTED_JSON_SUFFIXES = {".json"}
 SUPPORTED_IMPORT_SUFFIXES = SUPPORTED_TEXT_SUFFIXES | SUPPORTED_JSON_SUFFIXES
@@ -44,6 +45,64 @@ TIME_META_KEYS = (
     "time_granularity",
     "time_confidence",
 )
+
+
+def _normalize_auto_migrate_chat_mode(value: Any) -> str:
+    mode = str(value or "active_only").strip().lower()
+    if mode not in AUTO_MIGRATE_CHAT_MODES:
+        raise ValueError(f"未知聊天频道选择模式: {mode}")
+    return mode
+
+
+def _normalize_selected_chat_keys(value: Any) -> list[str]:
+    if isinstance(value, str):
+        raw_items = value.split(",")
+    elif isinstance(value, list):
+        raw_items = value
+    else:
+        raw_items = []
+
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        chat_key = str(item or "").strip()
+        if not chat_key or chat_key in seen:
+            continue
+        seen.add(chat_key)
+        result.append(chat_key)
+    return result
+
+
+def _channel_update_time_iso(channel: DBChatChannel) -> str:
+    update_time = getattr(channel, "update_time", None)
+    if update_time is None:
+        return ""
+    try:
+        return update_time.isoformat()
+    except AttributeError:
+        return str(update_time)
+
+
+def _serialize_auto_migrate_channel(
+    channel: DBChatChannel,
+    *,
+    last_imported_message_id: int,
+    pending_text_messages: int | None = None,
+) -> dict[str, Any]:
+    return {
+        "id": int(channel.id),
+        "chat_key": str(channel.chat_key or "").strip(),
+        "channel_name": str(channel.channel_name or "").strip(),
+        "adapter_key": str(channel.adapter_key or "").strip(),
+        "channel_id": str(channel.channel_id or "").strip(),
+        "channel_type": str(channel.channel_type or "").strip(),
+        "workspace_id": int(channel.workspace_id) if channel.workspace_id is not None else None,
+        "is_active": bool(channel.is_active),
+        "observe_mode": bool(channel.observe_mode),
+        "update_time": _channel_update_time_iso(channel),
+        "last_imported_message_id": int(last_imported_message_id),
+        "pending_text_messages": pending_text_messages,
+    }
 
 
 def resolve_local_plugin_data_dir(module_file: str | Path) -> Path:
@@ -877,6 +936,70 @@ class ImportBackend:
             forced_task_id=task_id,
         )
 
+    async def list_auto_migrate_channels(
+        self,
+        *,
+        mode: str = "all",
+        limit: int = 1000,
+        q: str = "",
+    ) -> dict[str, Any]:
+        from .plugin import plugin
+
+        normalized_mode = _normalize_auto_migrate_chat_mode(mode)
+        normalized_limit = max(1, min(2000, int(limit or 1000)))
+        query = str(q or "").strip().lower()
+
+        channel_query = DBChatChannel.all()
+        if normalized_mode == "active_only":
+            channel_query = DBChatChannel.filter(is_active=True)
+        channels = await channel_query.order_by("-update_time", "id").all()
+
+        results: list[dict[str, Any]] = []
+        seen_chat_keys: set[str] = set()
+        scanned = 0
+        for channel in channels:
+            chat_key = str(channel.chat_key or "").strip()
+            if not chat_key or chat_key in seen_chat_keys:
+                continue
+            seen_chat_keys.add(chat_key)
+            if query:
+                haystack = " ".join(
+                    [
+                        chat_key,
+                        str(channel.channel_name or ""),
+                        str(channel.adapter_key or ""),
+                        str(channel.channel_id or ""),
+                        str(channel.workspace_id or ""),
+                    ]
+                ).lower()
+                if query not in haystack:
+                    continue
+
+            scanned += 1
+            cursor = await get_chat_import_cursor(plugin.store, chat_key)
+            pending_count = (
+                await DBChatMessage.filter(chat_key=chat_key, id__gt=cursor)
+                .exclude(content_text="")
+                .count()
+            )
+            results.append(
+                _serialize_auto_migrate_channel(
+                    channel,
+                    last_imported_message_id=cursor,
+                    pending_text_messages=int(pending_count),
+                )
+            )
+            if len(results) >= normalized_limit:
+                break
+
+        return {
+            "channels": results,
+            "count": len(results),
+            "scanned": scanned,
+            "limit": normalized_limit,
+            "mode": normalized_mode,
+        }
+
     async def create_auto_migrate_task(self, payload: dict[str, Any]) -> dict[str, Any]:
         from .plugin import NaMemorixConfig, plugin
 
@@ -886,8 +1009,27 @@ class ImportBackend:
             raise ValueError("至少需要启用一种自动迁移来源")
 
         cfg = plugin.get_config(NaMemorixConfig)
-        chat_limit = max(1, min(200, int(payload.get("chat_limit", AUTO_MIGRATE_DEFAULT_CHAT_LIMIT) or AUTO_MIGRATE_DEFAULT_CHAT_LIMIT)))
-        message_window = max(4, min(200, int(payload.get("message_window", AUTO_MIGRATE_DEFAULT_MESSAGE_WINDOW) or AUTO_MIGRATE_DEFAULT_MESSAGE_WINDOW)))
+        chat_limit = max(
+            1,
+            min(
+                200,
+                int(payload.get("chat_limit", AUTO_MIGRATE_DEFAULT_CHAT_LIMIT) or AUTO_MIGRATE_DEFAULT_CHAT_LIMIT),
+            ),
+        )
+        message_window = max(
+            4,
+            min(
+                200,
+                int(
+                    payload.get("message_window", AUTO_MIGRATE_DEFAULT_MESSAGE_WINDOW)
+                    or AUTO_MIGRATE_DEFAULT_MESSAGE_WINDOW
+                ),
+            ),
+        )
+        chat_mode = _normalize_auto_migrate_chat_mode(payload.get("chat_mode", "active_only"))
+        selected_chat_keys = _normalize_selected_chat_keys(payload.get("selected_chat_keys", []))
+        if import_chat_summary and chat_mode == "selected" and not selected_chat_keys:
+            raise ValueError("指定频道模式下至少需要选择一个聊天频道")
         prepared_files: list[dict[str, Any]] = []
 
         if import_builtin_memory:
@@ -913,13 +1055,32 @@ class ImportBackend:
                 )
 
         if import_chat_summary:
-            chat_channels = (
-                await DBChatChannel.filter(is_active=True)
-                .order_by("-update_time")
-                .limit(chat_limit)
-                .all()
-            )
+            if chat_mode == "selected":
+                chat_rows = await DBChatChannel.filter(chat_key__in=selected_chat_keys).all()
+                chat_row_map: dict[str, DBChatChannel] = {}
+                for row in chat_rows:
+                    row_chat_key = str(row.chat_key or "").strip()
+                    if row_chat_key and row_chat_key not in chat_row_map:
+                        chat_row_map[row_chat_key] = row
+                chat_channels = [
+                    chat_row_map[item]
+                    for item in selected_chat_keys
+                    if item in chat_row_map
+                ]
+            elif chat_mode == "active_only":
+                chat_channels = (
+                    await DBChatChannel.filter(is_active=True)
+                    .order_by("-update_time", "id")
+                    .all()
+                )
+            else:
+                chat_channels = (
+                    await DBChatChannel.all()
+                    .order_by("-update_time", "id")
+                    .all()
+                )
             seen_chat_keys: set[str] = set()
+            prepared_chat_count = 0
             for channel in chat_channels:
                 chat_key = str(channel.chat_key or "").strip()
                 if not chat_key or chat_key in seen_chat_keys:
@@ -936,7 +1097,9 @@ class ImportBackend:
                 messages = [
                     {
                         "message_id": int(item.id),
-                        "role": "assistant" if str(item.sender_id or "") == "-1" else "user",
+                        "role": "assistant"
+                        if str(item.sender_id or "") == "-1"
+                        else "user",
                         "content": str(item.content_text or "").strip(),
                     }
                     for item in rows
@@ -944,14 +1107,23 @@ class ImportBackend:
                 ]
                 if not messages:
                     continue
+                channel_info = _serialize_auto_migrate_channel(
+                    channel,
+                    last_imported_message_id=cursor,
+                    pending_text_messages=None,
+                )
                 prepared_files.append(
                     self._build_auto_migrate_chat_file(
                         chat_key=chat_key,
                         messages=messages,
                         last_message_id=int(messages[-1]["message_id"]),
                         message_window=message_window,
+                        channel_info=channel_info,
                     )
                 )
+                prepared_chat_count += 1
+                if prepared_chat_count >= chat_limit:
+                    break
 
         if not prepared_files:
             raise ValueError("没有发现可自动迁移的记忆或聊天记录")
@@ -964,6 +1136,8 @@ class ImportBackend:
                 "options": copy.deepcopy(payload),
                 "import_builtin_memory": import_builtin_memory,
                 "import_chat_summary": import_chat_summary,
+                "chat_mode": chat_mode,
+                "selected_chat_keys": selected_chat_keys,
                 "chat_limit": chat_limit,
                 "message_window": message_window,
             },
@@ -1230,9 +1404,12 @@ class ImportBackend:
         messages: list[dict[str, Any]],
         last_message_id: int,
         message_window: int,
+        channel_info: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        channel_meta = copy.deepcopy(channel_info or {})
+        channel_label = str(channel_meta.get("channel_name") or chat_key or "").strip()
         message_count = len(messages)
-        preview = f"迁移聊天 {chat_key} 的 {message_count} 条增量消息"
+        preview = f"迁移聊天 {channel_label} 的 {message_count} 条增量消息"
         chunks = [
             _build_chunk_state(
                 index=0,
@@ -1245,15 +1422,17 @@ class ImportBackend:
                     "last_message_id": int(last_message_id),
                     "message_window": max(4, int(message_window)),
                     "source": f"chat_summary:{str(chat_key or '').strip()}",
+                    "channel": channel_meta,
                 },
             )
         ]
         file_state = {
             "file_id": uuid.uuid4().hex,
-            "name": str(chat_key or "").strip(),
+            "name": channel_label,
             "source_name": f"auto_migrate_chat:{str(chat_key or '').strip()}",
             "local_path": "",
             "detected_strategy_type": "auto_migrate",
+            "channel": channel_meta,
             "status": "queued",
             "current_step": "queued",
             "progress": 0.0,

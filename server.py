@@ -157,6 +157,8 @@ class ImportAutoMigrateTaskRequest(ImportCommonTaskRequest):
 
     import_builtin_memory: bool = True
     import_chat_summary: bool = True
+    chat_mode: str = "active_only"
+    selected_chat_keys: List[str] = Field(default_factory=list)
     chat_limit: int = Field(default=20, ge=1, le=200)
     message_window: int = Field(default=50, ge=4, le=200)
 
@@ -1673,6 +1675,28 @@ class MemorixServer:
                 _raise_import_backend_error(exc)
             except Exception as exc:
                 logger.error("Create import auto migrate task failed: %s", exc, exc_info=True)
+                raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+        @self.app.get("/api/import/auto_migrate/channels")
+        async def list_import_auto_migrate_channels(
+            mode: str = Query(default="all"),
+            limit: int = Query(default=1000, ge=1, le=2000),
+            q: str = Query(default=""),
+        ):
+            try:
+                return await self._import_backend.list_auto_migrate_channels(
+                    mode=mode,
+                    limit=limit,
+                    q=q,
+                )
+            except ValueError as exc:
+                _raise_import_backend_error(exc)
+            except Exception as exc:
+                logger.error(
+                    "List import auto migrate channels failed: %s",
+                    exc,
+                    exc_info=True,
+                )
                 raise HTTPException(status_code=500, detail=str(exc)) from exc
 
         @self.app.post("/api/import/tasks/temporal_backfill")
