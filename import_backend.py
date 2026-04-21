@@ -228,6 +228,139 @@ def _serialize_time_meta(raw_value: Any) -> dict[str, Any]:
     }
 
 
+def _resolve_graph_extraction_strategy(content: str, strategy_override: str = "") -> str:
+    """解析普通文本的图谱抽取策略，贴近 A_Memorix factual/narrative 分流。"""
+
+    override = str(strategy_override or "").strip().lower()
+    if override in {"factual", "narrative", "quote"}:
+        return override
+    try:
+        from core.storage import KnowledgeType, detect_knowledge_type
+
+        detected = detect_knowledge_type(str(content or ""))
+        if detected == KnowledgeType.NARRATIVE:
+            return "narrative"
+        if detected in {KnowledgeType.FACTUAL, KnowledgeType.STRUCTURED, KnowledgeType.MIXED}:
+            return "factual"
+    except Exception:
+        pass
+    return "factual"
+
+
+def _build_graph_extraction_prompt(content: str, strategy: str) -> str:
+    text = str(content or "").strip()
+    if strategy == "narrative":
+        return f"""You are a narrative knowledge extraction engine.
+Extract key events, entities, and character/object relations from the scene text.
+
+Language constraints:
+- Preserve original names and domain terms exactly when possible.
+- JSON keys must stay exactly as: events, entities, relations, subject, predicate, object.
+
+Text:
+{text}
+
+Return ONLY valid JSON:
+{{
+  "events": ["event description 1", "event description 2"],
+  "entities": ["Entity1", "Entity2"],
+  "relations": [
+    {{"subject": "Entity1", "predicate": "relation", "object": "Entity2"}}
+  ]
+}}
+"""
+
+    return f"""You are a factual knowledge extraction engine.
+Extract factual triples and entities from the text.
+
+Language constraints:
+- Preserve lists, definitions, product names, commands, file names, and domain terms accurately.
+- Preserve original language and exact names when possible.
+- JSON keys must stay exactly as: triples, entities, subject, predicate, object.
+
+Text:
+{text}
+
+Return ONLY valid JSON:
+{{
+  "triples": [
+    {{"subject": "Entity", "predicate": "Relationship", "object": "Entity"}}
+  ],
+  "entities": ["Entity1", "Entity2"]
+}}
+"""
+
+
+def _normalize_extracted_entities(raw_value: Any, *, limit: int = 40) -> list[str]:
+    if not isinstance(raw_value, list):
+        return []
+    entities: list[str] = []
+    seen: set[str] = set()
+    for item in raw_value:
+        if isinstance(item, dict):
+            text = str(item.get("name", item.get("text", item.get("entity", ""))) or "").strip()
+        else:
+            text = str(item or "").strip()
+        if not text or len(text) > 160:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        entities.append(text)
+        if len(entities) >= limit:
+            break
+    return entities
+
+
+def _normalize_extracted_relations(raw_payload: dict[str, Any], *, limit: int = 40) -> list[dict[str, Any]]:
+    raw_items: list[Any] = []
+    for key in ("relations", "triples", "spo_list", "openie"):
+        value = raw_payload.get(key)
+        if isinstance(value, list):
+            raw_items.extend(value)
+
+    relations: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for item in raw_items:
+        if isinstance(item, dict):
+            subject = str(item.get("subject", item.get("head", item.get("s", ""))) or "").strip()
+            predicate = str(item.get("predicate", item.get("relation", item.get("p", ""))) or "").strip()
+            obj = str(item.get("object", item.get("tail", item.get("o", ""))) or "").strip()
+            confidence = item.get("confidence", item.get("score", 1.0))
+        elif isinstance(item, list) and len(item) >= 3:
+            subject = str(item[0] or "").strip()
+            predicate = str(item[1] or "").strip()
+            obj = str(item[2] or "").strip()
+            confidence = 1.0
+        else:
+            continue
+
+        if not (subject and predicate and obj):
+            continue
+        if max(len(subject), len(predicate), len(obj)) > 160:
+            continue
+        relation_key = (subject.lower(), predicate.lower(), obj.lower())
+        if relation_key in seen:
+            continue
+        seen.add(relation_key)
+        try:
+            normalized_confidence = float(confidence or 1.0)
+        except (TypeError, ValueError):
+            normalized_confidence = 1.0
+        relations.append(
+            {
+                "subject": subject,
+                "predicate": predicate,
+                "object": obj,
+                "confidence": normalized_confidence,
+            }
+        )
+        if len(relations) >= limit:
+            break
+    return relations
+
+
 def _build_chunk_state(
     *,
     index: int,
@@ -251,6 +384,7 @@ def _build_text_chunks(
     *,
     source_name: str,
     strategy_override: str = "",
+    llm_enabled: bool = False,
     time_meta: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     paragraphs = _split_text(text)
@@ -260,6 +394,7 @@ def _build_text_chunks(
     serialized_time_meta = _serialize_time_meta(time_meta or {})
     chunks: list[dict[str, Any]] = []
     for index, paragraph in enumerate(paragraphs):
+        extraction_strategy = _resolve_graph_extraction_strategy(paragraph, strategy_override)
         chunks.append(
             _build_chunk_state(
                 index=index,
@@ -271,6 +406,8 @@ def _build_text_chunks(
                     "source": source_name,
                     "knowledge_type": chunk_type if chunk_type in {"narrative", "factual", "quote"} else "",
                     "time_meta": serialized_time_meta,
+                    "extract_graph": bool(llm_enabled),
+                    "extraction_strategy": extraction_strategy,
                 },
             )
         )
@@ -769,7 +906,8 @@ class ImportBackend:
                 "",
                 "## 已知约束",
                 "",
-                "- `dedupe_policy`、`llm_enabled` 等参数目前仅做兼容接收，不会改变底层 ImportService 的写入语义。",
+                "- 普通文本上传/粘贴在 `llm_enabled=true` 时会按 A_Memorix 风格调用模型抽取实体与关系，并写入知识图谱。",
+                "- `dedupe_policy` 目前仅做兼容接收，不会改变底层 ImportService 的写入语义。",
                 "- 自动迁移中的聊天总结会调用总结模型，首次迁移或积压较多时可能耗费较多 token。",
                 "- 时序回填优先消费提供的 JSON 时间字段；若没有可用字段且未禁用 created fallback，会回退到段落的 created_at。",
             ]
@@ -891,6 +1029,7 @@ class ImportBackend:
                 source_name=f"upload:{item.get('name', file_path.name)}",
                 input_mode=input_mode,
                 strategy_override=str(payload.get("strategy_override", "") or ""),
+                llm_enabled=bool(payload.get("llm_enabled", False)),
             )
             prepared_files.append(file_state)
             if current_schema == "web_json":
@@ -924,6 +1063,7 @@ class ImportBackend:
             source_name=f"paste:{paste_name}",
             input_mode=input_mode,
             strategy_override=str(payload.get("strategy_override", "") or ""),
+            llm_enabled=bool(payload.get("llm_enabled", False)),
         )
         return await self._create_task(
             task_kind="paste",
@@ -1294,6 +1434,7 @@ class ImportBackend:
         source_name: str,
         input_mode: str,
         strategy_override: str,
+        llm_enabled: bool,
     ) -> tuple[dict[str, Any], str]:
         file_content = file_path.read_text(encoding="utf-8")
         normalized_input_mode = str(input_mode or "text").strip().lower()
@@ -1307,6 +1448,7 @@ class ImportBackend:
                 file_content,
                 source_name=source_name,
                 strategy_override=strategy_override,
+                llm_enabled=llm_enabled,
             )
             detected_strategy_type = str(strategy_override or "text").strip() or "text"
 
@@ -1716,6 +1858,128 @@ class ImportBackend:
             except Exception:
                 logger.error("failed to persist import backend failure state", exc_info=True)
 
+    def _build_extraction_llm_client(self, ctx: Any) -> Any:
+        from amemorix.llm_client import LLMClient
+        from amemorix.settings import resolve_openapi_endpoint_config
+
+        endpoint_cfg = resolve_openapi_endpoint_config(ctx.config, section="embedding")
+        model_name = str(ctx.get_config("summarization.model_name", "") or "").strip()
+        if model_name.lower() == "auto":
+            model_name = ""
+        return LLMClient(
+            base_url=str(endpoint_cfg.get("base_url", "")),
+            api_key=str(endpoint_cfg.get("api_key", "")),
+            model=str(
+                model_name
+                or endpoint_cfg.get("chat_model", "")
+                or endpoint_cfg.get("model", "")
+                or "gpt-4o-mini"
+            ),
+            timeout_seconds=float(endpoint_cfg.get("timeout_seconds", 60) or 60),
+            max_retries=int(endpoint_cfg.get("max_retries", 3) or 3),
+        )
+
+    async def _extract_graph_payload_from_text(
+        self,
+        ctx: Any,
+        *,
+        content: str,
+        strategy: str,
+    ) -> dict[str, Any]:
+        normalized_strategy = str(strategy or "factual").strip().lower()
+        if normalized_strategy == "quote":
+            return {"entities": [], "relations": []}
+
+        client = self._build_extraction_llm_client(ctx)
+        prompt = _build_graph_extraction_prompt(content, normalized_strategy)
+        ok, payload, raw = await client.complete_json(prompt, temperature=0.1, max_tokens=1200)
+        if not ok or not isinstance(payload, dict):
+            logger.warning("Graph extraction returned non-JSON: %s", str(raw or "")[:240])
+            return {"entities": [], "relations": []}
+
+        entities = _normalize_extracted_entities(payload.get("entities", []))
+        if normalized_strategy == "narrative":
+            entities.extend(_normalize_extracted_entities(payload.get("events", []), limit=20))
+            entities = _normalize_extracted_entities(entities)
+        relations = _normalize_extracted_relations(payload)
+        for relation in relations:
+            entities.extend([relation["subject"], relation["object"]])
+        entities = _normalize_extracted_entities(entities)
+        return {"entities": entities, "relations": relations}
+
+    async def _add_extracted_entity(
+        self,
+        ctx: Any,
+        *,
+        name: str,
+        source_paragraph: str,
+    ) -> str | None:
+        entity_name = str(name or "").strip()
+        if not entity_name:
+            return None
+        try:
+            entity_hash = ctx.metadata_store.add_entity(entity_name, source_paragraph=source_paragraph)
+            ctx.graph_store.add_nodes([entity_name])
+            if entity_hash not in ctx.vector_store:
+                embedding = await ctx.embedding_manager.encode(entity_name)
+                ctx.vector_store.add(vectors=embedding.reshape(1, -1), ids=[entity_hash], kinds=["entity"])
+            return str(entity_hash)
+        except Exception as exc:
+            logger.warning("Add extracted entity failed: entity=%s err=%s", entity_name, exc)
+            return None
+
+    async def _apply_graph_extraction(
+        self,
+        import_service: Any,
+        ctx: Any,
+        *,
+        content: str,
+        paragraph_hash: str,
+        strategy: str,
+    ) -> dict[str, Any]:
+        payload = await self._extract_graph_payload_from_text(
+            ctx,
+            content=content,
+            strategy=strategy,
+        )
+        entities = list(payload.get("entities") or [])
+        relations = list(payload.get("relations") or [])
+
+        entity_count = 0
+        relation_count = 0
+        for entity in entities:
+            if await self._add_extracted_entity(ctx, name=str(entity), source_paragraph=paragraph_hash):
+                entity_count += 1
+
+        for relation in relations:
+            subject = str(relation.get("subject", "") or "").strip()
+            predicate = str(relation.get("predicate", "") or "").strip()
+            obj = str(relation.get("object", "") or "").strip()
+            if not (subject and predicate and obj):
+                continue
+            try:
+                await import_service.import_relation(
+                    subject=subject,
+                    predicate=predicate,
+                    obj=obj,
+                    confidence=float(relation.get("confidence", 1.0) or 1.0),
+                    source_paragraph=paragraph_hash,
+                )
+                relation_count += 1
+            except Exception as exc:
+                logger.warning(
+                    "Add extracted relation failed: %s | %s | %s err=%s",
+                    subject,
+                    predicate,
+                    obj,
+                    exc,
+                )
+
+        return {
+            "graph_entities": entity_count,
+            "graph_relations": relation_count,
+        }
+
     async def _execute_chunk_plan(
         self,
         import_service: Any,
@@ -1728,12 +1992,31 @@ class ImportBackend:
 
         kind = str(plan.get("kind", "") or "").strip()
         if kind == "paragraph":
-            return await import_service.import_paragraph(
+            result = await import_service.import_paragraph(
                 content=str(plan.get("content", "") or ""),
                 source=str(plan.get("source", "web_import") or "web_import"),
                 knowledge_type=str(plan.get("knowledge_type", "") or ""),
                 time_meta=dict(plan.get("time_meta") or {}),
             )
+            if bool(plan.get("extract_graph", False)) and result.get("hash"):
+                try:
+                    graph_result = await self._apply_graph_extraction(
+                        import_service,
+                        ctx,
+                        content=str(plan.get("content", "") or ""),
+                        paragraph_hash=str(result["hash"]),
+                        strategy=str(plan.get("extraction_strategy", "") or ""),
+                    )
+                    result.update(graph_result)
+                    result["saved"] = True
+                except Exception as exc:
+                    logger.warning(
+                        "Graph extraction skipped after paragraph import: hash=%s err=%s",
+                        result.get("hash"),
+                        exc,
+                    )
+                    result["graph_extraction_error"] = str(exc)
+            return result
         if kind == "relation":
             source_paragraph = str(plan.get("source_paragraph", "") or "").strip()
             if not source_paragraph and plan.get("source_paragraph_chunk_index") is not None:

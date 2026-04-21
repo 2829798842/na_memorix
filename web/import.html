@@ -1626,6 +1626,14 @@ Content-Type: application/json
           toast("请先选择文件");
           return;
         }
+        if (
+          $("llm-enabled").checked &&
+          !confirm(
+            "启用 LLM 抽取会对普通文本分块调用模型抽取实体与关系，可能消耗较多 token。确定继续吗？",
+          )
+        ) {
+          return;
+        }
         const fd = new FormData();
         state.files.forEach((f) => fd.append("files[]", f, f.name));
         fd.append(
@@ -1650,6 +1658,14 @@ Content-Type: application/json
         const content = $("paste-content").value || "";
         if (!content.trim()) {
           toast("粘贴内容不能为空");
+          return;
+        }
+        if (
+          $("llm-enabled").checked &&
+          !confirm(
+            "启用 LLM 抽取会对普通文本分块调用模型抽取实体与关系，可能消耗较多 token。确定继续吗？",
+          )
+        ) {
           return;
         }
         const d = await req("/api/import/tasks/paste", {
