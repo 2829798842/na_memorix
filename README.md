@@ -2,17 +2,6 @@
 
 `na_memorix` 是一个基于 A_memorix 特化为 Nekro Agent 的知识库/记忆插件。它保留了核心检索与图谱处理链路，但将运行方式、存储后端和宿主集成方式改成了更适合 Nekro 插件体系的实现。
 
-## 它能做什么
-
-- 导入文本知识、聊天总结、实体与关系数据。
-- 执行语义检索、时间检索、实体检索和关系检索。
-- 维护记忆图谱，支持边权调整、冻结、恢复、强化、保护等操作。
-- 为 Agent 自动注入记忆上下文。
-- 按每日固定时间批量总结活跃频道新增聊天记录，并写入长期记忆。
-- 提供人物画像查询、覆盖和注册表管理。
-- 提供 Web 可视化界面，用于浏览图谱、查看来源、管理记忆和触发重建索引。
-- 暴露兼容的 `/api/*` 与 `/v1/*` 接口，便于前端和旧调用链继续工作。
-
 ## Web 界面入口
 
 - [打开主面板](/plugins/litroenade.na_memorix/)
@@ -20,17 +9,34 @@
 - [打开检索调优](/plugins/litroenade.na_memorix/tuning)
 - [项目仓库](https://github.com/litroenade/na_memorix)
 
+
+
+## 它能做什么
+
+- 导入文本知识、聊天总结、实体与关系数据。
+- 执行语义检索、时间检索、实体检索和关系检索。
+- 维护记忆图谱，支持边权调整、冻结、恢复、强化、保护等操作。
+- 为 Agent 自动注入记忆上下文。
+- 按每日固定时间批量总结活跃频道新增聊天记录，并写入长期记忆。
+- 在导入中心一键迁移 Nekro-Agent 已存储的原生记忆和历史聊天记录。
+- 普通文本上传/粘贴可选启用 LLM 实体关系抽取，将资料写入知识图谱。
+- 提供人物画像查询、覆盖和注册表管理。
+- 提供 Web 可视化界面，用于浏览图谱、查看来源、管理记忆和触发重建索引。
+- 暴露兼容的 `/api/*` 与 `/v1/*` 接口，便于前端和旧调用链继续工作。
+
+## 运行策略
+
+`na_memorix` 默认不启用插件休眠。
+
+原因是它承担的是长期记忆与知识库基础能力：自动记忆注入依赖 prompt inject，`memorix_search`、`memorix_status` 等主动检索工具依赖 sandbox methods prompt。若插件进入休眠状态，宿主只会展示插件简述，不会渲染记忆注入内容和工具说明，模型就无法稳定获得相关记忆或主动调用检索工具。
+
+关闭休眠的代价是每轮对话会多一小段插件提示和工具说明。可以通过 `AUTO_INJECT_TOP_K`、`AUTO_INJECT_MIN_SCORE`、聊天过滤配置和全局开关控制注入规模。
+
 ### 存储后端
  
  
 - 图快照：持久化到 PostgreSQL 图表；本地旧图文件仅作为兼容迁移输入
 - 稀疏检索默认后端：PostgreSQL
-
-相关实现见：
-
-- [core/storage/metadata_store.py](./core/storage/metadata_store.py)
-- [core/storage/vector_store.py](./core/storage/vector_store.py)
-- [amemorix/bootstrap.py](./amemorix/bootstrap.py)
 
 ### 外部依赖来源
 
@@ -86,6 +92,10 @@ data/plugin_data/{plugin.key}/runtime/
   - Embedding 维度。
 - `SUMMARIZATION_MODEL_GROUP`
   - 聊天总结模型组名。
+- `SUMMARIZATION_TIMEOUT_SECONDS`
+  - 单次聊天总结模型请求超时时间，默认 `60` 秒，独立于 Embedding 超时。
+- `GRAPH_EXTRACTION_TIMEOUT_SECONDS`
+  - 上传或粘贴文本启用 LLM 抽取时，单次实体/关系抽取请求超时时间，默认 `60` 秒。
 - `SUMMARIZATION_CONTEXT_LENGTH`
   - 手动总结和定时总结每次读取的聊天消息窗口大小。
 - `SCHEDULED_SUMMARY_ENABLED`
@@ -104,6 +114,14 @@ data/plugin_data/{plugin.key}/runtime/
   - Qdrant 关系集合名。
 - `TABLE_PREFIX`
   - PostgreSQL 表名前缀。
+
+## 导入与清理说明
+
+- 导入中心支持上传、粘贴、自动迁移记忆和时序回填。
+- “启用 LLM 抽取”会对普通文本分块调用聊天模型抽取实体与关系，可能消耗较多 token；若只需要段落检索，可关闭该选项。
+- “自动迁移记忆”会复用 Nekro-Agent 已存储的原生记忆和聊天记录；聊天总结会调用总结模型，重复执行会根据游标增量推进。
+- 清理误导入资料时，优先按来源删除，例如 `upload:xxx.txt`、`paste:xxx`、`chat_summary:{chat_key}`。这会清理对应段落、向量以及孤立关系/图边，不会删除宿主原始聊天记录。
+- 若需要完全重置 na_memorix，需要同时清空插件数据、向量、图谱和自动迁移游标；不要直接删除宿主数据库里的聊天记录或 Nekro-Agent 原生记忆表。
 
 ## 前端说明
 

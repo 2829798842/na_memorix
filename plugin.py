@@ -42,7 +42,7 @@ plugin = NekroPlugin(
     name="na_memorix",
     module_name="na_memorix",
     description="A_Memorix-style memory graph plugin",
-    version="0.2.0",
+    version="0.3.0",
     author="litroenade",
     url="",
     i18n_name=i18n.i18n_text(
@@ -53,7 +53,7 @@ plugin = NekroPlugin(
         zh_CN="在 Nekro Agent 中提供 **知识库** 与 **长期记忆** 能力",
         en_US="Provides knowledge base and long-term memory capabilities inside Nekro Agent",
     ),
-    allow_sleep=True,
+    allow_sleep=False,
     sleep_brief="用于长期记忆检索、图谱知识导入与当前聊天上下文的自动记忆注入。",
 )
 bind_plugin_logger(plugin)
