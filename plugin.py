@@ -318,6 +318,28 @@ class NaMemorixConfig(ConfigBase):
             "placeholder": "default",
         },
     )
+    SUMMARIZATION_TIMEOUT_SECONDS: int = _config_field(
+        60,
+        category_zh="模型配置",
+        category_en="Model Configuration",
+        title_zh="记忆总结超时（秒）",
+        title_en="Memory Summarization Timeout (s)",
+        description_zh="单次聊天总结模型请求的超时时间。独立于 Embedding 超时，模型响应较慢时可适当调大。",
+        description_en="Timeout for a single summarization model request. This is independent from embedding timeout.",
+        ge=5,
+        le=600,
+    )
+    GRAPH_EXTRACTION_TIMEOUT_SECONDS: int = _config_field(
+        60,
+        category_zh="模型配置",
+        category_en="Model Configuration",
+        title_zh="图谱抽取超时（秒）",
+        title_en="Graph Extraction Timeout (s)",
+        description_zh="上传或粘贴文本启用 LLM 抽取时，单次实体/关系抽取请求的超时时间。独立于 Embedding 和聊天总结超时。",
+        description_en="Timeout for a single entity/relation extraction request during LLM-enabled text imports.",
+        ge=5,
+        le=600,
+    )
     SUMMARIZATION_CONTEXT_LENGTH: int = _config_field(
         50,
         category_zh="模型配置",
@@ -529,6 +551,7 @@ STRUCTURAL_PATHS: tuple[str, ...] = (
     "embedding",
     "retrieval",
     "summarization",
+    "graph_extraction",
     "threshold",
     "graph",
     "qdrant",
@@ -710,6 +733,12 @@ def _build_settings_dict(config_obj: NaMemorixConfig) -> dict[str, Any]:
             "context_length": int(config_obj.SUMMARIZATION_CONTEXT_LENGTH),
             "model_name": str(config_obj.SUMMARIZATION_MODEL_GROUP or "default"),
             "model_group": str(config_obj.SUMMARIZATION_MODEL_GROUP or "default"),
+            "timeout_seconds": int(config_obj.SUMMARIZATION_TIMEOUT_SECONDS),
+        },
+        "graph_extraction": {
+            "model_name": str(config_obj.SUMMARIZATION_MODEL_GROUP or "default"),
+            "model_group": str(config_obj.SUMMARIZATION_MODEL_GROUP or "default"),
+            "timeout_seconds": int(config_obj.GRAPH_EXTRACTION_TIMEOUT_SECONDS),
         },
         "schedule": {
             "enabled": bool(config_obj.SCHEDULED_SUMMARY_ENABLED),

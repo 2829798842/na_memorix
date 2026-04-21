@@ -1862,8 +1862,14 @@ class ImportBackend:
         from amemorix.llm_client import LLMClient
         from amemorix.settings import resolve_openapi_endpoint_config
 
-        endpoint_cfg = resolve_openapi_endpoint_config(ctx.config, section="embedding")
-        model_name = str(ctx.get_config("summarization.model_name", "") or "").strip()
+        endpoint_cfg = resolve_openapi_endpoint_config(ctx.config, section="graph_extraction")
+        model_name = str(
+            ctx.get_config(
+                "graph_extraction.model_name",
+                ctx.get_config("summarization.model_name", ""),
+            )
+            or ""
+        ).strip()
         if model_name.lower() == "auto":
             model_name = ""
         return LLMClient(

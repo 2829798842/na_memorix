@@ -242,6 +242,7 @@ def resolve_openapi_endpoint_config(config: Dict[str, Any], *, section: str = "e
     Compatibility rules:
     - Preferred: `[embedding.openapi]`
     - Legacy compatible: `[embedding.openai]`
+    - Section-level `timeout_seconds` / `max_retries` are accepted for plugin runtime overlays.
     - Env aliases: `OPENAPI_*` first, then `OPENAI_*`
     """
     root = config.get(section, {}) if isinstance(config, dict) else {}
@@ -265,6 +266,13 @@ def resolve_openapi_endpoint_config(config: Dict[str, Any], *, section: str = "e
 
     # Start from legacy config, then apply non-empty openapi overrides.
     merged = _overlay_non_empty(legacy_cfg, openapi_cfg)
+    merged = _overlay_non_empty(
+        merged,
+        {
+            "timeout_seconds": root.get("timeout_seconds"),
+            "max_retries": root.get("max_retries"),
+        },
+    )
 
     env_aliases: Dict[str, list[str]] = {
         "base_url": ["OPENAPI_BASE_URL", "OPENAI_BASE_URL"],

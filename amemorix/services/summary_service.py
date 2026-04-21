@@ -12,7 +12,7 @@ from amemorix.settings import resolve_openapi_endpoint_config
 class SummaryService:
     def __init__(self, ctx: AppContext):
         self.ctx = ctx
-        endpoint_cfg = resolve_openapi_endpoint_config(self.ctx.config, section="embedding")
+        endpoint_cfg = resolve_openapi_endpoint_config(self.ctx.config, section="summarization")
         summarization_model = str(self.ctx.get_config("summarization.model_name", "") or "").strip()
         if summarization_model.lower() == "auto":
             summarization_model = ""
