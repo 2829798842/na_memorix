@@ -674,6 +674,9 @@ def _build_settings_dict(config_obj: NaMemorixConfig) -> dict[str, Any]:
             "model_name": str(config_obj.EMBEDDING_MODEL_GROUP),
             "model_group": str(config_obj.EMBEDDING_MODEL_GROUP),
             "timeout_seconds": int(config_obj.EMBEDDING_TIMEOUT_SECONDS),
+            # 插件模式从 Nekro 模型组解析 endpoint，避免继承 standalone OpenAI 默认端点。
+            "openai": None,
+            "openapi": None,
         },
         "retrieval": {
             "top_k_paragraphs": int(config_obj.TOP_K_PARAGRAPHS),

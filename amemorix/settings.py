@@ -248,6 +248,11 @@ def resolve_openapi_endpoint_config(config: Dict[str, Any], *, section: str = "e
     if not isinstance(root, dict):
         root = {}
 
+    uses_model_group_endpoint = str(root.get("model_group") or root.get("model_name") or "").strip().lower() not in {
+        "",
+        "auto",
+    }
+
     legacy_cfg = root.get("openai", {})
     if not isinstance(legacy_cfg, dict):
         legacy_cfg = {}
@@ -255,6 +260,8 @@ def resolve_openapi_endpoint_config(config: Dict[str, Any], *, section: str = "e
     openapi_cfg = root.get("openapi", {})
     if not isinstance(openapi_cfg, dict):
         openapi_cfg = {}
+
+    explicit_endpoint_cfg = bool(legacy_cfg or openapi_cfg)
 
     # Start from legacy config, then apply non-empty openapi overrides.
     merged = _overlay_non_empty(legacy_cfg, openapi_cfg)
@@ -288,7 +295,7 @@ def resolve_openapi_endpoint_config(config: Dict[str, Any], *, section: str = "e
             merged[field] = _parse_env_value(env_value)
 
     # Sensible defaults for OpenAI-compatible providers.
-    if not str(merged.get("base_url", "") or "").strip():
+    if not str(merged.get("base_url", "") or "").strip() and (explicit_endpoint_cfg or not uses_model_group_endpoint):
         merged["base_url"] = "https://api.openai.com/v1"
     if "timeout_seconds" not in merged:
         merged["timeout_seconds"] = 30
