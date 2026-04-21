@@ -2,19 +2,20 @@
 
 import asyncio
 import threading
+import uuid
 from enum import Enum
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
 import numpy as np
+from amemorix.common.logging import get_logger
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
 
 from nekro_agent.core.vector_db import get_qdrant_config
 
-from amemorix.common.logging import get_logger
-
 logger = get_logger("A_Memorix.VectorStore")
+_POINT_ID_NAMESPACE = uuid.UUID("4b5d8d8f-7e55-4ec0-a9f7-2f42827ed9dc")
 
 
 class QuantizationType(Enum):
@@ -138,6 +139,55 @@ class VectorStore:
         return str(getattr(self.metadata_store, "table_prefix", "") or "")
 
     @staticmethod
+    def _is_valid_qdrant_point_id(value: str) -> bool:
+        """判断给定字符串是否已经是 Qdrant 可接受的 point id。"""
+        normalized = str(value or "").strip()
+        if not normalized:
+            return False
+        if normalized.isdigit():
+            return True
+        try:
+            uuid.UUID(normalized)
+        except ValueError:
+            return False
+        return True
+
+    @classmethod
+    def _point_id_for_hash(cls, hash_value: str) -> int | str:
+        """将内部 hash 映射为 Qdrant 接受的整数或 UUID point id。"""
+        normalized = str(hash_value or "").strip()
+        if not normalized:
+            raise ValueError("point hash is empty")
+        if normalized.isdigit():
+            return int(normalized)
+        if cls._is_valid_qdrant_point_id(normalized):
+            return normalized
+        return str(uuid.uuid5(_POINT_ID_NAMESPACE, normalized))
+
+    @classmethod
+    def _candidate_point_ids(cls, hash_value: str) -> list[int | str]:
+        """返回用于兼容查询/删除的候选 point id 列表。"""
+        normalized = str(hash_value or "").strip()
+        if not normalized:
+            return []
+        candidates: list[int | str] = [cls._point_id_for_hash(normalized)]
+        if cls._is_valid_qdrant_point_id(normalized):
+            raw: int | str = int(normalized) if normalized.isdigit() else normalized
+            if raw not in candidates:
+                candidates.append(raw)
+        return candidates
+
+    @staticmethod
+    def _hash_from_hit(hit: object) -> str:
+        """优先从 payload 中还原内部 hash，缺失时回退到 point id。"""
+        payload = getattr(hit, "payload", None)
+        if isinstance(payload, dict):
+            hash_value = str(payload.get("hash", "") or "").strip()
+            if hash_value:
+                return hash_value
+        return str(getattr(hit, "id", "") or "").strip()
+
+    @staticmethod
     def _run_async(coro):
         """在同步上下文中执行异步协程。
 
@@ -208,13 +258,14 @@ class VectorStore:
         relation_points: list[models.PointStruct] = []
         for idx, point_id in enumerate(ids):
             point_hash = str(point_id)
+            qdrant_point_id = self._point_id_for_hash(point_hash)
             kind = str(kinds[idx] if kinds is not None else self._kind_for_id(point_hash)).strip().lower() or "paragraph"
             payload = {
                 "hash": point_hash,
                 "kind": kind,
                 "table_prefix": self._table_prefix(),
             }
-            point = models.PointStruct(id=point_hash, vector=arr[idx].tolist(), payload=payload)
+            point = models.PointStruct(id=qdrant_point_id, vector=arr[idx].tolist(), payload=payload)
             if kind == "relation":
                 relation_points.append(point)
             else:
@@ -246,13 +297,13 @@ class VectorStore:
                     collection_name=collection_name,
                     query_vector=arr.tolist(),
                     limit=limit,
-                    with_payload=False,
+                    with_payload=True,
                 )
             except Exception as exc:
                 logger.warning("Qdrant search failed on %s: %s", collection_name, exc)
                 continue
             for hit in hits:
-                point_id = str(hit.id)
+                point_id = self._hash_from_hit(hit)
                 score = float(hit.score)
                 if point_id not in merged or score > merged[point_id]:
                     merged[point_id] = score
@@ -269,7 +320,10 @@ class VectorStore:
         Returns:
             int: 删除的点数量。
         """
-        point_ids = [str(item) for item in ids if str(item)]
+        point_ids: list[int | str] = []
+        for item in ids:
+            point_ids.extend(self._candidate_point_ids(str(item)))
+        point_ids = list(dict.fromkeys(point_ids))
         if not point_ids:
             return 0
         selector = models.PointIdsList(points=point_ids)
@@ -405,9 +459,12 @@ class VectorStore:
         point_id = str(hash_value or "").strip()
         if not point_id:
             return False
+        candidate_ids = self._candidate_point_ids(point_id)
+        if not candidate_ids:
+            return False
         for collection_name in (self.chunk_collection, self.relation_collection):
             try:
-                records = self._client.retrieve(collection_name=collection_name, ids=[point_id], with_payload=False)
+                records = self._client.retrieve(collection_name=collection_name, ids=candidate_ids, with_payload=False)
             except Exception:
                 continue
             if records:

@@ -9,11 +9,11 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import psycopg2
+from amemorix.common.logging import get_logger
 from psycopg2.extras import RealDictCursor
 
 from nekro_agent.core.tortoise_config import resolve_db_url
 
-from amemorix.common.logging import get_logger
 from ..utils.hash import compute_hash, normalize_text
 from ..utils.runtime_dependencies import load_jieba
 from ..utils.time_parser import normalize_time_meta
@@ -2390,7 +2390,7 @@ class MetadataStore:
             Dict[str, Any]: 创建后的任务记录。
         """
         now = time.time()
-        with self._cursor() as cursor:
+        with self._dict_cursor() as cursor:
             cursor.execute(
                 f"""
                 INSERT INTO {self._table('async_tasks')} (
@@ -2415,7 +2415,7 @@ class MetadataStore:
                     now,
                 ),
             )
-            row = dict(cursor.fetchone())
+            row = cursor.fetchone()
         self._maybe_commit()
         return self._decode_task(row) or {}
 

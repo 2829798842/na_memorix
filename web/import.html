@@ -51,11 +51,6 @@
         color: var(--muted);
         font-size: 12px;
       }
-      .token {
-        display: flex;
-        gap: 8px;
-        min-width: 360px;
-      }
       .grid {
         display: grid;
         grid-template-columns: 420px 1fr;
@@ -480,10 +475,6 @@
         .grid {
           grid-template-columns: 1fr;
         }
-        .token {
-          min-width: 0;
-          width: 100%;
-        }
         .top {
           flex-direction: column;
           align-items: stretch;
@@ -535,15 +526,6 @@
           >
             检索调优兼容页
           </button>
-        </div>
-        <div class="token">
-          <input
-            id="token-input"
-            type="password"
-            placeholder="可选：X-Memorix-Import-Token"
-          />
-          <button class="btn" id="token-save">保存</button>
-          <button class="btn" id="token-clear">清空</button>
         </div>
       </div>
       <div id="feature-banner" class="feature-banner" data-level="warn"></div>
@@ -1072,16 +1054,9 @@ Content-Type: application/json
         clearTimeout(window._tt);
         window._tt = setTimeout(() => (t.style.display = "none"), 2200);
       }
-      function token() {
-        return String(
-          localStorage.getItem("memorix_import_token") || "",
-        ).trim();
-      }
       function headers(isJson = true) {
         const h = {};
         if (isJson) h["Content-Type"] = "application/json";
-        const tk = token();
-        if (tk) h["X-Memorix-Import-Token"] = tk;
         return h;
       }
       async function req(path, opt = {}) {
@@ -1681,19 +1656,6 @@ Content-Type: application/json
       }
 
       function bind() {
-        $("token-input").value = token();
-        $("token-save").onclick = () => {
-          localStorage.setItem(
-            "memorix_import_token",
-            String($("token-input").value || "").trim(),
-          );
-          toast("Token 已保存");
-        };
-        $("token-clear").onclick = () => {
-          localStorage.removeItem("memorix_import_token");
-          $("token-input").value = "";
-          toast("Token 已清空");
-        };
         $("guide-open").onclick = () => openGuideModal();
         $("guide-close").onclick = () => closeGuideModal();
         $("guide-modal").onclick = (e) => {

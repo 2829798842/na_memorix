@@ -25,6 +25,8 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+runtime
+
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
@@ -239,3 +241,8 @@ scripts/debug_graph_vis.py
 /.tmp_test_sqlite
 /.tmp_testdata
 /scripts/tmp
+
+
+
+
+
